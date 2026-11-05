@@ -1154,18 +1154,33 @@ func (d *Detector) cosineSimilarity(a, b map[string]int) float64 {
 // errCasAuth marks a CAS response rejecting the token, which ends retries.
 var errCasAuth = errors.New("cas token rejected")
 
-// isCasSpam checks if a given user ID is a spammer with CAS API.
+// isCasSpam checks if a given user ID is a spammer with CAS API. A failed lookup is reported as not spam.
 func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
+	resp, _ := d.casLookup(context.Background(), msgID)
+	return resp
+}
+
+// CheckCAS asks CAS about a user. An error means the answer is unknown, which is not the same as "not a spammer".
+func (d *Detector) CheckCAS(ctx context.Context, userID int64) (spam bool, details string, err error) {
+	if d.CasAPI == "" || d.CasToken == "" {
+		return false, "cas is not configured", nil
+	}
+	resp, err := d.casLookup(ctx, strconv.FormatInt(userID, 10))
+	return resp.Spam, resp.Details, err
+}
+
+// casLookup calls the CAS API. The error is set when the answer could not be obtained, the response then says not spam.
+func (d *Detector) casLookup(ctx context.Context, msgID string) (spamcheck.Response, error) {
 	if msgID == "" {
-		return spamcheck.Response{Spam: false, Name: "cas", Details: "check disabled"}
+		return spamcheck.Response{Spam: false, Name: "cas", Details: "check disabled"}, nil
 	}
 	if _, err := strconv.ParseInt(msgID, 10, 64); err != nil {
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("invalid user id %q", msgID)}
+		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("invalid user id %q", msgID)}, err
 	}
 	reqURL := fmt.Sprintf("%s/check?user_id=%s", d.CasAPI, msgID)
-	req, err := http.NewRequest("GET", reqURL, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to make request %s: %v", reqURL, err)}
+		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to make request %s: %v", reqURL, err)}, err
 	}
 
 	// header, not the api_key query parameter: reqURL goes into Details and log lines
@@ -1183,7 +1198,7 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 		Jitter:   true,
 	})
 
-	err = rptr.Do(context.Background(), func() error {
+	err = rptr.Do(ctx, func() error {
 		var httpErr error
 		resp, httpErr = d.HTTPClient.Do(req)
 		if httpErr != nil {
@@ -1220,7 +1235,7 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 
 	if err != nil {
 		log.Printf("[WARN] CAS API request failed for user %s: %v", msgID, err)
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to send request %s: %v", reqURL, err)}
+		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to send request %s: %v", reqURL, err)}, err
 	}
 	defer resp.Body.Close()
 
@@ -1231,7 +1246,7 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 
 	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
 		log.Printf("[WARN] CAS API response parse error for user %s: %v", msgID, err)
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to parse response from %s: %v", reqURL, err)}
+		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to parse response from %s: %v", reqURL, err)}, err
 	}
 	respData.Description = strings.ToLower(respData.Description)
 	respData.Description = strings.TrimSuffix(respData.Description, ".")
@@ -1241,13 +1256,13 @@ func (d *Detector) isCasSpam(msgID string) spamcheck.Response {
 		if respData.Description == "" {
 			respData.Description = "spam detected"
 		}
-		return spamcheck.Response{Name: "cas", Spam: true, Details: respData.Description}
+		return spamcheck.Response{Name: "cas", Spam: true, Details: respData.Description}, nil
 	}
 	details := respData.Description
 	if details == "" {
 		details = "not found"
 	}
-	return spamcheck.Response{Name: "cas", Spam: false, Details: details}
+	return spamcheck.Response{Name: "cas", Spam: false, Details: details}, nil
 }
 
 // isSpamClassified classify tokens from a document

@@ -53,3 +53,8 @@ INSTALL.md
 .golangci.yml
 Makefile
 webapp.rest
+
+# secrets and local state never go to the build context
+.env
+.env.*
+var/

@@ -1,0 +1,91 @@
+# wording of the questions asked to jev. the data it looks at is in the request state:
+#   event          comment, reaction or join
+#   post.text      the channel post the comment belongs to
+#   comment.text   the comment, comment.reply_to_text the message it replies to
+#   user           first_name, last_name, username, is_premium, bio, personal_channel (title, description, last_posts)
+#   profile_photos avatars of the user (images)
+# changing the wording invalidates the thresholds calibrated with it, re-run the dry-run after edits.
+
+comment_class:
+  instructions: >-
+    What kind of comment is `comment`? It was posted under a post of a public Telegram channel.
+    Judge the comment text only, not the author.
+  classes:
+    ok: >-
+      An ordinary reaction of a reader: opinion, question, joke, thanks, agreement, disagreement, rudeness, emoji,
+      short replies like "Ого, как интересно!" or "Согласна 👍". Links shared as part of a conversation are fine.
+    job_scam: >-
+      Offers of easy earnings, part-time work or a job from home with promised money: "подработка", "заработок без
+      вложений", "ищу людей на удалёнку, 5000 в день", "пиши в лс", "доход от 100$ в день".
+    adult: >-
+      Offers or invitations of intimate, erotic or escort services, dating for money, "скучаю, пиши", sexual content ads.
+    drugs: >-
+      Selling or advertising of prohibited substances: "закладки", "мефедрон", "шишки", "доставка 24/7", "в наличии".
+    invest_scam: >-
+      Casino and betting promotion, crypto schemes, "сигналы", trading and investment offers with guaranteed profit,
+      "удвою вложения", pyramid and referral schemes.
+    other_ad: >-
+      Any other unsolicited advertising: selling goods or services, promoting channels, bots, groups or accounts,
+      "подпишись на мой канал", "заходи в профиль".
+
+comment_relevance:
+  instructions: >-
+    How closely is `comment` tied to the content of `post`? A comment that would fit under any post is generic.
+  levels:
+    - >-
+      Generic template that fits under any post: "Ого, как интересно!", "Согласна 👍", "Супер", "Класс!", "Так и есть",
+      a lone emoji or a compliment without any detail.
+    - >-
+      Loosely related: it touches the general topic of the post but has no concrete detail of it.
+    - >-
+      Specific to the post: it refers to a concrete fact, name, number, claim or situation from the post.
+
+bait:
+  instructions: >-
+    Is `comment` empty of meaning and probably written only to make readers open the profile of its author?
+  true: >-
+    A short flattering or vague comment that says nothing about the post and invites curiosity about the author,
+    typical of accounts that advertise in their profile: "Ого, как интересно!", "Согласна 👍", "Вот это да 😍".
+  false: >-
+    The comment has its own content: an argument, a question, a fact, a joke about the post, a real reaction
+    to something concrete, even if it is short.
+
+profile_adult:
+  instructions: >-
+    Does the profile of `user` (bio, personal channel, avatars in `profile_photos`) advertise intimate or escort
+    services, erotic content for money or adult dating?
+  true: >-
+    The bio, channel or avatars lure to adult services: erotic photos, "скучаю 💋 пиши", "эскорт", "встречусь",
+    "интим", links to adult channels or sites, a model-like photo with a call to write privately.
+  false: >-
+    Ordinary person or business: no bio, a normal bio, a neutral or attractive but not suggestive photo,
+    a personal channel about hobbies, work or life.
+
+profile_drugs:
+  instructions: >-
+    Does the profile of `user` (bio, personal channel, avatars in `profile_photos`) advertise prohibited substances?
+  true: >-
+    The bio or channel sells or promotes drugs: "закладки", "мефедрон", "шишки", "доставка", "в наличии", menus,
+    prices of substances, links to shops of such goods.
+  false: >-
+    No sign of selling prohibited substances. Mentions of medicine, pharmacy, coffee or tea shops are fine.
+
+profile_scam:
+  instructions: >-
+    Does the profile of `user` (bio, personal channel, avatars in `profile_photos`) advertise easy earnings,
+    casinos, crypto or investment schemes or other financial scams?
+  true: >-
+    The bio or channel promotes "заработок без вложений", "подработка", "пассивный доход", casino or betting links,
+    crypto signals, guaranteed profit, referral schemes, "пиши +" for money.
+  false: >-
+    No financial promises. Honest mentions of own job, business, trading as a hobby without selling anything are fine.
+
+photo_provocative:
+  instructions: >-
+    Are the avatars in `profile_photos` provocative or explicit photos typical for advertising accounts?
+  true: >-
+    Revealing, erotic or suggestive photos of a person, lingerie or swimwear in a seductive pose, a stock-model look
+    with watermarks or contact data on the picture.
+  false: >-
+    Ordinary photos: portraits, family, pets, landscapes, logos, memes, drawings, cars, even if the person is
+    attractive or on a beach in normal clothes.

@@ -42,33 +42,35 @@ func (f SpamLoggerFunc) Save(msg *bot.Message, response *bot.Response) {
 // TelegramListener listens to tg update, forward to bots and send back responses
 // Not thread safe
 type TelegramListener struct {
-	TbAPI                   TbAPI         // telegram bot API
-	SpamLogger              SpamLogger    // logger to save spam to files and db
-	Bot                     Bot           // bot to handle messages
-	BotUsername             string        // telegram bot username (without "@" prefix)
-	Group                   string        // can be int64 or public group username (without "@" prefix)
-	AdminGroup              string        // can be int64 or public group username (without "@" prefix)
-	IdleDuration            time.Duration // idle timeout to send "idle" message to bots
-	SuperUsers              SuperUsers    // list of superusers, can ban and report spam, can't be banned
-	TestingIDs              []int64       // list of chat IDs to test the bot
-	StartupMsg              string        // message to send on startup to the primary chat
-	WarnMsg                 string        // message to send on warning
-	NoSpamReply             bool          // do not reply on spam messages in the primary chat
-	SuppressJoinMessage     bool          // delete join message when kick out user
-	DeleteJoinMessages      bool          // delete join messages immediately
-	DeleteLeaveMessages     bool          // delete leave messages immediately
-	TrainingMode            bool          // do not ban users, just report and train spam detector
-	SoftBanMode             bool          // do not ban users, but restrict their actions
-	Locator                 Locator       // message locator to get info about messages
-	ReportConfig            ReportConfig  // user spam reporting configuration
-	DisableAdminSpamForward bool          // disable forwarding spam reports to admin chat support
-	Dry                     bool          // dry run, do not ban or send messages
-	AggressiveCleanup       bool          // delete all messages from user when banned via /spam command
-	AggressiveCleanupLimit  int           // max messages to delete in aggressive cleanup mode
-	WarnThreshold           int           // auto-ban after N warns within window (0=disabled)
-	WarnWindow              time.Duration // sliding window for counting warns
-	Warnings                Warnings      // storage for admin /warn records
-	AdmitDocuments          bool          // admit text-less documents for detector checks and locator-backed counters
+	TbAPI                   TbAPI          // telegram bot API
+	SpamLogger              SpamLogger     // logger to save spam to files and db
+	Bot                     Bot            // bot to handle messages
+	BotUsername             string         // telegram bot username (without "@" prefix)
+	Group                   string         // can be int64 or public group username (without "@" prefix)
+	AdminGroup              string         // can be int64 or public group username (without "@" prefix)
+	IdleDuration            time.Duration  // idle timeout to send "idle" message to bots
+	SuperUsers              SuperUsers     // list of superusers, can ban and report spam, can't be banned
+	TestingIDs              []int64        // list of chat IDs to test the bot
+	StartupMsg              string         // message to send on startup to the primary chat
+	WarnMsg                 string         // message to send on warning
+	NoSpamReply             bool           // do not reply on spam messages in the primary chat
+	SuppressJoinMessage     bool           // delete join message when kick out user
+	DeleteJoinMessages      bool           // delete join messages immediately
+	DeleteLeaveMessages     bool           // delete leave messages immediately
+	TrainingMode            bool           // do not ban users, just report and train spam detector
+	SoftBanMode             bool           // do not ban users, but restrict their actions
+	Locator                 Locator        // message locator to get info about messages
+	ReportConfig            ReportConfig   // user spam reporting configuration
+	DisableAdminSpamForward bool           // disable forwarding spam reports to admin chat support
+	Dry                     bool           // dry run, do not ban or send messages
+	AggressiveCleanup       bool           // delete all messages from user when banned via /spam command
+	AggressiveCleanupLimit  int            // max messages to delete in aggressive cleanup mode
+	WarnThreshold           int            // auto-ban after N warns within window (0=disabled)
+	WarnWindow              time.Duration  // sliding window for counting warns
+	Warnings                Warnings       // storage for admin /warn records
+	AdmitDocuments          bool           // admit text-less documents for detector checks and locator-backed counters
+	Profile                 ProfileChecker // profile check of non-approved users, nil disables it
+	ProfileWorkers          int            // parallel profile checks, 0 uses the default
 
 	adminHandler    *admin
 	reportsHandler  *userReports
@@ -76,6 +78,9 @@ type TelegramListener struct {
 	chatID          int64
 	adminChatID     int64
 	linkedChannelID int64 // channel linked to the discussion group, resolved at startup
+	profileJobs     chan func(context.Context)
+	profileRetry    sync.Map // decision id -> button of a failed card action, pressing it again repeats the action
+	profileBanned   sync.Map // user id -> time of the last profile ban, hides the cards of a burst of comments
 
 	msgs struct {
 		once sync.Once
@@ -131,6 +136,8 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 		}
 		log.Printf("[INFO] admin chat ID: %d", l.adminChatID)
 	}
+
+	l.startProfileWorkers(ctx)
 
 	l.msgs.once.Do(func() {
 		l.msgs.ch = make(chan bot.Response, 100)
@@ -212,6 +219,15 @@ func (l *TelegramListener) Do(ctx context.Context) error {
 			// handle admin chat inline buttons - route based on callback prefix
 			if update.CallbackQuery != nil {
 				callbackData := update.CallbackQuery.Data
+
+				// profile card buttons (prefix P) are handled by the profile check
+				if strings.HasPrefix(callbackData, profileCallbackPrefix) {
+					if err := l.HandleProfileCallback(ctx, update.CallbackQuery); err != nil {
+						log.Printf("[WARN] failed to process profile callback: %v", err)
+						l.postErrorToAdmin(err)
+					}
+					continue
+				}
 
 				// delegate report callbacks (prefixes R+, R-, R?, R!, RX) to reportsHandler
 				if len(callbackData) >= 3 && callbackData[:1] == "R" {
@@ -431,12 +447,19 @@ func (l *TelegramListener) procEvents(update tbapi.Update) error {
 	// when the linked channel posts, SenderChat.ID equals the linked channel ID.
 	if msg.SenderChat.ID != 0 && (msg.SenderChat.ID == fromChat || msg.SenderChat.ID == l.linkedChannelID) {
 		log.Printf("[DEBUG] skipping spam check for anonymous admin post from group itself or linked channel")
+		if l.Profile != nil && l.linkedChannelID != 0 && msg.SenderChat.ID == l.linkedChannelID {
+			l.Profile.RememberPost(msg.ID, msg.Text) // comments under the post are judged against its text
+		}
 		return nil
 	}
 
+	checkProfile := l.profileEligible(update.Message, msg, fromChat) // before OnMessage, it may approve the user
 	resp := l.Bot.OnMessage(*msg, false)
 
 	if !resp.Send { // not spam
+		if checkProfile {
+			l.profileComment(update.Message, msg)
+		}
 		return nil
 	}
 
@@ -608,6 +631,7 @@ func (l *TelegramListener) procJoin(ctx context.Context, msg *tbapi.Message) err
 
 		resp := l.Bot.OnJoin(user)
 		if resp.BanInterval <= 0 {
+			l.profileJoin(member)
 			continue
 		}
 
@@ -923,6 +947,7 @@ func (l *TelegramListener) procReaction(ctx context.Context, r *tbapi.MessageRea
 		}
 	}
 	if resp.BanInterval <= 0 {
+		l.profileReaction(r)
 		return nil
 	}
 

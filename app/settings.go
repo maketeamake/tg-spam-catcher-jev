@@ -111,6 +111,26 @@ func optToSettings(opts options) *config.Settings {
 			GibberishThreshold: opts.Jev.GibberishThreshold,
 		},
 
+		Profile: config.ProfileSettings{
+			Enabled:            opts.Profile.Enabled,
+			CacheTTL:           opts.Profile.CacheTTL,
+			PhotosLimit:        opts.Profile.PhotosLimit,
+			PersonalPostsLimit: opts.Profile.PersonalPostsLimit,
+			CheckJoin:          opts.Profile.CheckJoin,
+			ReviewTimeout:      opts.Profile.ReviewTimeout,
+			Workers:            opts.Profile.Workers,
+			Model:              opts.Jev.ProfileModel,
+			Timeout:            opts.Jev.ProfileTimeout,
+			CriteriaFile:       opts.Jev.CriteriaFile,
+			CommentBan:         opts.Jev.Th.CommentBan,
+			CommentReview:      opts.Jev.Th.CommentReview,
+			ProfileBan:         opts.Jev.Th.ProfileBan,
+			ProfileReview:      opts.Jev.Th.ProfileReview,
+			Bait:               opts.Jev.Th.Bait,
+			Photo:              opts.Jev.Th.Photo,
+			ExportCSV:          opts.Profile.ExportCSV,
+		},
+
 		LLM: config.LLMSettings{
 			Consensus:      opts.LLM.Consensus,
 			RequestTimeout: opts.LLM.RequestTimeout,

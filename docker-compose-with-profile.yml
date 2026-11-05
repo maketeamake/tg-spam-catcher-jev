@@ -1,0 +1,29 @@
+# compose file for tg-spam with the jev profile check, one instance serves one discussion group.
+# Secrets come from the environment or from a git-ignored .env file next to this file, never from this file:
+#   TELEGRAM_TOKEN, TELEGRAM_GROUP, ADMIN_GROUP, JEV_TOKEN, CAS_TOKEN (optional)
+# Rollout: start with PROFILE_DRY=true (cards are sent, nothing is banned or deleted), read the decisions with
+#   docker compose -f docker-compose-with-profile.yml run --rm tg-spam --profile.export-csv=/srv/data/profile.csv
+# tune the --jev.th.* thresholds, then set PROFILE_DRY=false.
+services:
+  tg-spam:
+    image: tg-spam-profile:${TG_SPAM_TAG:-local} # docker build -t tg-spam-profile:$(git rev-parse --short HEAD) .
+    hostname: tg-spam
+    restart: unless-stopped
+    container_name: tg-spam
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    environment:
+      - TELEGRAM_TOKEN
+      - TELEGRAM_GROUP
+      - ADMIN_GROUP # required: REVIEW results wait there for an admin
+      - JEV_TOKEN
+      - CAS_TOKEN
+      - PROFILE_ENABLED=true
+      - PROFILE_CHECK_JOIN=${PROFILE_CHECK_JOIN:-false}
+      - DRY=${PROFILE_DRY:-true}
+      - NO_SPAM_REPLY=true # no "this is spam" reply in the chat, the admin chat gets the report
+    volumes:
+      - ./var:/srv/data # database with dossiers, decisions and reviews; back it up before the first start

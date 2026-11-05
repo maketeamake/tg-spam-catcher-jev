@@ -32,6 +32,7 @@ import (
 	"github.com/umputun/tg-spam/app/bot"
 	"github.com/umputun/tg-spam/app/config"
 	"github.com/umputun/tg-spam/app/events"
+	"github.com/umputun/tg-spam/app/profile"
 	"github.com/umputun/tg-spam/app/storage"
 	"github.com/umputun/tg-spam/app/storage/engine"
 	"github.com/umputun/tg-spam/app/webapi"
@@ -145,7 +146,31 @@ type options struct {
 		HistorySize        int     `long:"history-size" env:"HISTORY_SIZE" default:"0" description:"jev history size"`
 		CheckShortMessages bool    `long:"check-short-messages" env:"CHECK_SHORT_MESSAGES" description:"check messages shorter than min-msg-len with jev"`
 		GibberishThreshold float64 `long:"gibberish-threshold" env:"GIBBERISH_THRESHOLD" default:"0" description:"gibberish probability at or above this is spam, 0 disables"`
+
+		ProfileModel   string        `long:"profile-model" env:"PROFILE_MODEL" default:"jev-1.14.0" description:"jev model for profile checks, pinned version not an alias"`
+		ProfileTimeout time.Duration `long:"profile-timeout" env:"PROFILE_TIMEOUT" default:"3s" description:"timeout of one jev profile request"`
+		CriteriaFile   string        `long:"criteria-file" env:"CRITERIA_FILE" description:"yaml file with the wording of profile questions, built-in wording if empty"`
+
+		Th struct {
+			CommentBan    float64 `long:"comment-ban" env:"COMMENT_BAN" default:"0.90" description:"spam comment class probability that bans"`
+			CommentReview float64 `long:"comment-review" env:"COMMENT_REVIEW" default:"0.60" description:"spam comment class probability that goes to review"`
+			ProfileBan    float64 `long:"profile-ban" env:"PROFILE_BAN" default:"0.85" description:"profile ads probability that bans when backed up"`
+			ProfileReview float64 `long:"profile-review" env:"PROFILE_REVIEW" default:"0.60" description:"profile ads probability that goes to review"`
+			Bait          float64 `long:"bait" env:"BAIT" default:"0.70" description:"bait comment probability that backs up a bad profile"`
+			Photo         float64 `long:"photo" env:"PHOTO" default:"0.85" description:"provocative avatar probability"`
+		} `group:"jev thresholds" namespace:"th" env-namespace:"TH"`
 	} `group:"jev" namespace:"jev" env-namespace:"JEV"`
+
+	Profile struct {
+		Enabled            bool          `long:"enabled" env:"ENABLED" description:"check profiles of non-approved users with jev, needs jev.token"`
+		CacheTTL           time.Duration `long:"cache-ttl" env:"CACHE_TTL" default:"168h" description:"how long a user dossier is cached"`
+		PhotosLimit        int           `long:"photos-limit" env:"PHOTOS_LIMIT" default:"3" description:"avatars sent to jev"`
+		PersonalPostsLimit int           `long:"personal-posts-limit" env:"PERSONAL_POSTS_LIMIT" default:"5" description:"posts of the personal channel sent to jev"`
+		CheckJoin          bool          `long:"check-join" env:"CHECK_JOIN" description:"check profiles of new members, CAS is checked on join anyway"`
+		ReviewTimeout      time.Duration `long:"review-timeout" env:"REVIEW_TIMEOUT" default:"24h" description:"an unanswered review is marked expired after this time, the restriction stays"`
+		Workers            int           `long:"workers" env:"WORKERS" default:"64" description:"parallel profile checks"`
+		ExportCSV          string        `long:"export-csv" env:"EXPORT_CSV" description:"write all profile decisions with admin verdicts to this csv file and exit"`
+	} `group:"profile" namespace:"profile" env-namespace:"PROFILE"`
 
 	LLM struct {
 		Consensus      string        `long:"consensus" env:"CONSENSUS" choice:"any" choice:"all" default:"any" description:"how eligible LLMs flip the base decision"`
@@ -427,6 +452,10 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		return fmt.Errorf("can't make db, %w", err)
 	}
 
+	if settings.Profile.ExportCSV != "" {
+		return exportProfileDecisions(ctx, settings, dataDB)
+	}
+
 	// make detector with all sample files loaded
 	detector := makeDetector(settings)
 
@@ -544,6 +573,21 @@ func execute(ctx context.Context, settings *config.Settings, reloadNormalize fun
 		WarnWindow:              settings.Warn.Window,
 		Warnings:                warningsStore,
 		AdmitDocuments:          settings.Meta.DocumentsOnly,
+	}
+
+	if settings.Profile.Enabled {
+		profileSvc, pErr := makeProfileService(ctx, settings, tbAPI, detector, dataDB)
+		if pErr != nil {
+			return fmt.Errorf("can't make profile check, %w", pErr)
+		}
+		tgListener.Profile = profileSvc
+		tgListener.ProfileWorkers = settings.Profile.Workers
+		go profileSvc.Run(ctx, time.Hour, settings.Profile.ReviewTimeout)
+		log.Printf("[INFO] profile check on: model %s, photos %d, join %v, review timeout %v, thresholds %+v",
+			settings.Profile.Model, settings.Profile.PhotosLimit, settings.Profile.CheckJoin, settings.Profile.ReviewTimeout,
+			profile.Thresholds{CommentBan: settings.Profile.CommentBan, CommentReview: settings.Profile.CommentReview,
+				ProfileBan: settings.Profile.ProfileBan, ProfileReview: settings.Profile.ProfileReview,
+				Bait: settings.Profile.Bait, Photo: settings.Profile.Photo})
 	}
 
 	if settings.Delete.JoinMessages {

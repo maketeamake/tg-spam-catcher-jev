@@ -65,7 +65,13 @@ func New(ctx context.Context, connURL, gid string) (*SQL, error) {
 
 // NewSqlite creates a new sqlite database
 func NewSqlite(file, gid string) (*SQL, error) {
-	db, err := sqlx.Connect("sqlite", file)
+	// busy_timeout is a per-connection pragma, so it goes into the dsn to cover every connection of the pool:
+	// several stores write to one file from different goroutines and must wait for each other instead of failing
+	sep := "?"
+	if strings.Contains(file, "?") {
+		sep = "&"
+	}
+	db, err := sqlx.Connect("sqlite", file+sep+"_pragma=busy_timeout(5000)")
 	if err != nil {
 		return &SQL{}, fmt.Errorf("failed to connect to sqlite: %w", err)
 	}

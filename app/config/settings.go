@@ -29,6 +29,7 @@ type Settings struct {
 	OpenAI        OpenAISettings        `json:"openai" yaml:"openai" db:"openai"`
 	Gemini        GeminiSettings        `json:"gemini" yaml:"gemini" db:"gemini"`
 	Jev           JevSettings           `json:"jev" yaml:"jev" db:"jev"`
+	Profile       ProfileSettings       `json:"profile" yaml:"profile" db:"profile"`
 	LLM           LLMSettings           `json:"llm" yaml:"llm" db:"llm"`
 	LuaPlugins    LuaPluginsSettings    `json:"lua_plugins" yaml:"lua_plugins" db:"lua_plugins"`
 	AbnormalSpace AbnormalSpaceSettings `json:"abnormal_spacing" yaml:"abnormal_spacing" db:"abnormal_spacing"`
@@ -178,6 +179,27 @@ type JevSettings struct {
 	HistorySize        int     `json:"history_size" yaml:"history_size" db:"jev_history_size"`
 	CheckShortMessages bool    `json:"check_short_messages" yaml:"check_short_messages" db:"jev_check_short_messages"`
 	GibberishThreshold float64 `json:"gibberish_threshold" yaml:"gibberish_threshold" db:"jev_gibberish_threshold"`
+}
+
+// ProfileSettings contains the profile check settings. The jev token is shared with JevSettings.
+type ProfileSettings struct {
+	Enabled            bool          `json:"enabled" yaml:"enabled" db:"profile_enabled"`
+	CacheTTL           time.Duration `json:"cache_ttl" yaml:"cache_ttl" db:"profile_cache_ttl"`
+	PhotosLimit        int           `json:"photos_limit" yaml:"photos_limit" db:"profile_photos_limit"`
+	PersonalPostsLimit int           `json:"personal_posts_limit" yaml:"personal_posts_limit" db:"profile_personal_posts_limit"`
+	CheckJoin          bool          `json:"check_join" yaml:"check_join" db:"profile_check_join"`
+	ReviewTimeout      time.Duration `json:"review_timeout" yaml:"review_timeout" db:"profile_review_timeout"`
+	Workers            int           `json:"workers" yaml:"workers" db:"profile_workers"`
+	Model              string        `json:"model" yaml:"model" db:"profile_model"`
+	Timeout            time.Duration `json:"timeout" yaml:"timeout" db:"profile_timeout"`
+	CriteriaFile       string        `json:"criteria_file" yaml:"criteria_file" db:"profile_criteria_file"`
+	CommentBan         float64       `json:"th_comment_ban" yaml:"th_comment_ban" db:"profile_th_comment_ban"`
+	CommentReview      float64       `json:"th_comment_review" yaml:"th_comment_review" db:"profile_th_comment_review"`
+	ProfileBan         float64       `json:"th_profile_ban" yaml:"th_profile_ban" db:"profile_th_profile_ban"`
+	ProfileReview      float64       `json:"th_profile_review" yaml:"th_profile_review" db:"profile_th_profile_review"`
+	Bait               float64       `json:"th_bait" yaml:"th_bait" db:"profile_th_bait"`
+	Photo              float64       `json:"th_photo" yaml:"th_photo" db:"profile_th_photo"`
+	ExportCSV          string        `json:"-" yaml:"-" db:"-"` // one-shot command: write decisions to this file and exit
 }
 
 // LLMSettings contains shared LLM orchestration settings
@@ -347,6 +369,27 @@ func (s *Settings) Validate() error {
 	}
 	if err := s.validateJev(); err != nil {
 		return err
+	}
+	return s.validateProfile()
+}
+
+// validateProfile checks the profile check options. Review cards need an admin chat to be answered in,
+// otherwise a restricted user would stay restricted with nobody to release them.
+func (s *Settings) validateProfile() error {
+	if !s.Profile.Enabled {
+		return nil
+	}
+	if s.Jev.Token == "" {
+		return fmt.Errorf("profile.enabled requires jev.token")
+	}
+	if s.Admin.AdminGroup == "" && !s.Dry && !s.Training {
+		return fmt.Errorf("profile.enabled requires admin.group outside dry-run and training mode")
+	}
+	if s.Profile.Workers < 1 {
+		return fmt.Errorf("profile.workers (%d) must be >= 1", s.Profile.Workers)
+	}
+	if s.Profile.ReviewTimeout <= 0 {
+		return fmt.Errorf("profile.review-timeout (%v) must be positive", s.Profile.ReviewTimeout)
 	}
 	return nil
 }

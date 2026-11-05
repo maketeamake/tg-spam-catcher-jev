@@ -1,3 +1,68 @@
+# tg-spam-catcher-jev
+
+A fork of [umputun/tg-spam](https://github.com/umputun/tg-spam) (MIT) that adds a **profile check** for Telegram channel comments, reactions and joins, powered by [jev](https://typesafe.ai). tg-spam judges the text of a message; this fork also looks at **who wrote it**: bio, personal channel, avatars. That catches spammers who write innocent comments ("Great post!") from a profile that is an ad.
+
+> **Status: working proof of concept.** Verified on real Telegram with a test channel, a discussion group and an admin group (comment, reaction, review, ban, unban, retry of a failed card action). Thresholds are not calibrated on production traffic, so run with `--dry` first. See [Known limits](#known-limits).
+
+## How it works
+
+```mermaid
+flowchart TD
+    A["New event in the discussion group<br/>comment / reaction / join"] --> B{"Superuser, admin or<br/>already approved?"}
+    B -- yes --> Z["Ignore"]
+    B -- no --> C["tg-spam checks the text<br/>(stop words, classifier, similarity, LLM ...)"]
+    C -- spam --> D["Normal tg-spam action:<br/>delete message, ban"]
+    C -- ham --> E["Profile check<br/>queued, never blocks the bot"]
+    E --> F["Dossier: name, bio, personal channel<br/>and its last posts, up to 3 avatars<br/>(cached 7 days)"]
+    F --> G["jev: one request, several typed questions<br/>comment class, relevance to the post, bait,<br/>profile ads (adult / drugs / scam), photo"]
+    G --> H{"Decision rules"}
+    H -- "clear spam<br/>or ad profile backed up by the comment" --> I["BAN<br/>delete comment, ban user"]
+    H -- "doubtful" --> J["REVIEW<br/>delete comment, restrict user,<br/>admin card"]
+    H -- "nothing found, or jev failed" --> K["PASS / SKIP<br/>nothing changes"]
+    I --> L["Admin card with buttons<br/>Unban / Not spam"]
+    J --> M["Admin card with buttons<br/>Ban / Not spam"]
+```
+
+In plain words:
+
+1. **tg-spam goes first.** Everything upstream tg-spam does still works. The profile check runs only on messages it found clean, from users who are not approved yet.
+2. **Read the profile.** The bot reads the sender's public profile through the Bot API (bio, personal channel with its last posts, up to three avatars) and caches it for 7 days (a returning user only gets a cheap re-check of name and first avatar).
+3. **Ask jev once.** The dossier, the comment and the channel post go to jev in a single request with typed questions. jev returns numbers (probabilities), not prose.
+4. **Decide with fixed rules, not with a model.** A spam-class comment bans on its own. An ad-like profile bans only when something backs it up: a reaction (a reaction has no text, so the profile is all there is), a generic template comment, a bait comment, or on a join a provocative photo. Weaker signals go to a human (REVIEW). The rules are in [`app/profile/decide.go`](app/profile/decide.go), the thresholds are `--jev.th.*` options.
+5. **A human has the last word.** Every BAN and REVIEW posts a card to the admin chat with inline buttons. A wrong decision is one click away from being undone, and the click also teaches the bot to trust that user.
+6. **Failures are safe.** If jev is down, slow or answers garbage, the result is SKIP: no sanction is ever based on a failed call. A full queue drops the event with a warning instead of stalling the bot.
+
+| Event | Checked by | Text is judged | Profile is judged | Possible result |
+|-------|------------|----------------|-------------------|-----------------|
+| Comment under a channel post | tg-spam, then jev | yes | yes | BAN / REVIEW / PASS |
+| Reaction to a message | CAS, then jev | no (no text) | yes | BAN / REVIEW / PASS |
+| New member (`--profile.check-join`) | CAS, then jev | no | yes (and photo) | BAN / REVIEW / PASS |
+
+### Quick start
+
+```bash
+cp docker-compose-with-profile.yml docker-compose.yml
+# put TELEGRAM_TOKEN, TELEGRAM_GROUP, ADMIN_GROUP, JEV_TOKEN into a git-ignored .env, then:
+docker compose up -d        # starts in dry-run: cards are sent, nothing is changed in Telegram
+```
+
+Set `PROFILE_DRY=false` when the cards in the admin chat look right. All options are listed in [Profile check (jev)](#profile-check-jev) and in the options block below.
+
+### Known limits
+
+- The Bot API cannot remove another user's reaction, so a spammer's reaction stays visible after the ban. Reactions on channel posts (outside the discussion group) are not handled.
+- Thresholds are defaults from a small test, not calibrated on production traffic. Run `--dry` and read `--profile.export-csv` before enforcing.
+- `--jev.token` also enables the stock tg-spam jev text check (threshold 0.30, messages of at least `--min-msg-len` characters). Raise `--jev.threshold` to 0.95 if you want the profile layer alone.
+- A join is taken from the `new_chat_members` service message, not from `chat_member` updates.
+- The profile options are command line and environment only: no web settings page, no DB-backed config.
+- Not verified: Postgres storage, the docker image build, real avatars and the join check on live Telegram.
+
+### Credits and license
+
+MIT, like upstream. All of the spam detection engine is [umputun/tg-spam](https://github.com/umputun/tg-spam); the original README follows unchanged except for the profile check section.
+
+---
+
 # tg-spam
 
 TG-Spam is an effective, self-hosted anti-spam bot specifically crafted for Telegram groups. Setting it up is straightforward as a Docker container, needing just a Telegram token and a group name or ID for the user to get started. Once activated, TG-Spam oversees messages, leveraging an advanced spam detection methods to pinpoint and eliminate spam content.
@@ -147,6 +212,19 @@ Setting `--jev.token [$JEV_TOKEN]` enables [jev](https://docs.typesafe.ai), a de
 - `--jev.veto`, `--jev.history-size` and `--jev.check-short-messages` behave exactly as their OpenAI and Gemini counterparts.
 - `--jev.gibberish-threshold` (off by default, `0`) adds a second question to the same jev call: is the message random letter groups that are not words in any language, like `dsfg dfgh ewrt xczv dsfh`. A gibberish probability at or above the threshold marks the message as spam, whatever the spam question says; below it, the spam question decides as usual. `0.50` is a reasonable start: replayed on 1,061 distinct inputs rebuilt from six days of one chat's messages (15+ characters, deduplicated), it flagged only the one gibberish post; in a separate set of hand-written test messages, slang, laughter, repeated letters, code and text typed in the wrong keyboard layout all stayed below it. Gibberish made of Cyrillic letters (`фыва олдж`) scores lower and is mostly missed at `0.50`. The question wording is fixed, since the threshold was measured against it. It requires `--jev.history-size=0`, because history is sent as part of the judged message. The question is not asked for messages with quoted or replied-to text, because that text is sent together with the message and would be judged as the sender's own; a gibberish post that quotes or replies to a text message is therefore not caught by the gibberish question. A reply to a message without text, such as a photo or a sticker, remains eligible for gibberish judging. Like every jev check it only sees messages at least `--min-msg-len` long (default 50; the example above is 24) unless `--jev.check-short-messages` is set. In veto mode jev runs only on messages other checks already flagged, except short messages with `--jev.check-short-messages`, so without that flag the gibberish question cannot catch a first message in veto mode.
 - `--jev.retry-count` is total attempts, not retries after the first, and every error is retried regardless of its HTTP status. That is the behavior shared with the other providers, not something specific to jev.
+
+**Profile check (jev)**
+
+`--profile.enabled` adds a second line of defence for channel comments: after tg-spam finds a message clean, the sender's profile dossier (name, bio, personal channel and its last posts, up to `--profile.photos-limit` avatars) is read and jev is asked about the comment and the profile together. The rules are in `docs/TZ_antispam_bot.md` section 5.3 and `docs/profile-check-plan.md`; the thresholds are the `--jev.th.*` options and the question wording is `app/profile/criteria.yml` (override with `--jev.criteria-file`). Changing either invalidates the calibration.
+
+- Needs `--jev.token`, and `--admin.group` unless `--dry` or `--training` is set: a REVIEW result restricts the user until an admin answers, so without an admin chat nobody could release them.
+- Events: a comment of a non-approved user, a reaction of a non-approved user (CAS and profile only, nothing to delete), and with `--profile.check-join` a new member. CAS is always checked on a reaction or a join. Approved users never reach jev.
+- Results: BAN deletes the comment and bans the user (in `--soft-ban` mode only restricts); REVIEW deletes the comment and restricts the user; PASS and SKIP change nothing. An unreachable or malformed jev answer is SKIP, never a sanction. The admin card carries the avatar, the profile, the reason and buttons: "Ban" / "Not spam" for REVIEW, "Unban" for BAN. Cards are sent in `--dry` and `--training` mode too, but nothing is deleted, banned, restricted or lifted, buttons included.
+- Dossiers are cached by user id for `--profile.cache-ttl`; on a cache hit the name, username and the first avatar are re-checked, so a changed profile is read again. Avatars are kept in memory only.
+- Work runs on `--profile.workers` workers and a bounded queue; when the queue is full the event is dropped with a warning and the update loop never blocks. The p95 of 3 s from the specification holds on dossier cache hits, a first sight of a user may take longer.
+- Statistics: an hourly log line, and `--profile.export-csv=FILE` writes every decision with the admin verdict and exits.
+- Not wired into the DB-backed settings, the web settings page or the e2e UI test: these options are command line and environment only.
+- Deviation from the specification: a join is taken from the `new_chat_members` service message, not from `chat_member` updates.
 
 **LLM consensus**
 
@@ -772,6 +850,27 @@ jev:
       --jev.history-size=               jev history size (default: 0) [$JEV_HISTORY_SIZE]
       --jev.check-short-messages        check messages shorter than min-msg-len with jev [$JEV_CHECK_SHORT_MESSAGES]
       --jev.gibberish-threshold=        gibberish probability at or above this is spam, 0 disables (default: 0) [$JEV_GIBBERISH_THRESHOLD]
+      --jev.profile-model=              jev model for profile checks, pinned version not an alias (default: jev-1.14.0) [$JEV_PROFILE_MODEL]
+      --jev.profile-timeout=            timeout of one jev profile request (default: 3s) [$JEV_PROFILE_TIMEOUT]
+      --jev.criteria-file=              yaml file with the wording of profile questions, built-in wording if empty [$JEV_CRITERIA_FILE]
+
+jev thresholds:
+      --jev.th.comment-ban=             spam comment class probability that bans (default: 0.90) [$JEV_TH_COMMENT_BAN]
+      --jev.th.comment-review=          spam comment class probability that goes to review (default: 0.60) [$JEV_TH_COMMENT_REVIEW]
+      --jev.th.profile-ban=             profile ads probability that bans when backed up (default: 0.85) [$JEV_TH_PROFILE_BAN]
+      --jev.th.profile-review=          profile ads probability that goes to review (default: 0.60) [$JEV_TH_PROFILE_REVIEW]
+      --jev.th.bait=                    bait comment probability that backs up a bad profile (default: 0.70) [$JEV_TH_BAIT]
+      --jev.th.photo=                   provocative avatar probability (default: 0.85) [$JEV_TH_PHOTO]
+
+profile:
+      --profile.enabled                 check profiles of non-approved users with jev, needs jev.token [$PROFILE_ENABLED]
+      --profile.cache-ttl=              how long a user dossier is cached (default: 168h) [$PROFILE_CACHE_TTL]
+      --profile.photos-limit=           avatars sent to jev (default: 3) [$PROFILE_PHOTOS_LIMIT]
+      --profile.personal-posts-limit=   posts of the personal channel sent to jev (default: 5) [$PROFILE_PERSONAL_POSTS_LIMIT]
+      --profile.check-join              check profiles of new members, CAS is checked on join anyway [$PROFILE_CHECK_JOIN]
+      --profile.review-timeout=         an unanswered review is marked expired after this time, the restriction stays (default: 24h) [$PROFILE_REVIEW_TIMEOUT]
+      --profile.workers=                parallel profile checks (default: 64) [$PROFILE_WORKERS]
+      --profile.export-csv=             write all profile decisions with admin verdicts to this csv file and exit [$PROFILE_EXPORT_CSV]
 
 llm:
       --llm.consensus=[any|all]         how eligible LLMs flip the base decision (default: any) [$LLM_CONSENSUS]
