@@ -6,22 +6,7 @@ A fork of [umputun/tg-spam](https://github.com/umputun/tg-spam) (MIT) that adds 
 
 ## How it works
 
-```mermaid
-flowchart TD
-    A["New event in the discussion group<br/>comment / reaction / join"] --> B{"Superuser, admin or<br/>already approved?"}
-    B -- yes --> Z["Ignore"]
-    B -- no --> C["tg-spam checks the text<br/>(stop words, classifier, similarity, LLM ...)"]
-    C -- spam --> D["Normal tg-spam action:<br/>delete message, ban"]
-    C -- ham --> E["Profile check<br/>queued, never blocks the bot"]
-    E --> F["Dossier: name, bio, personal channel<br/>and its last posts, up to 3 avatars<br/>(cached 7 days)"]
-    F --> G["jev: one request, several typed questions<br/>comment class, relevance to the post, bait,<br/>profile ads (adult / drugs / scam), photo"]
-    G --> H{"Decision rules"}
-    H -- "clear spam<br/>or ad profile backed up by the comment" --> I["BAN<br/>delete comment, ban user"]
-    H -- "doubtful" --> J["REVIEW<br/>delete comment, restrict user,<br/>admin card"]
-    H -- "nothing found, or jev failed" --> K["PASS / SKIP<br/>nothing changes"]
-    I --> L["Admin card with buttons<br/>Unban / Not spam"]
-    J --> M["Admin card with buttons<br/>Ban / Not spam"]
-```
+![How tg-spam-catcher-jev decides: event, tg-spam text check, profile, jev, rules, BAN / REVIEW / PASS, admin card](docs/how-it-works.svg)
 
 In plain words:
 
