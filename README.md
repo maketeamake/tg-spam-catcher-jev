@@ -23,6 +23,82 @@ In plain words:
 | Reaction to a message | CAS, then jev | no (no text) | yes | BAN / REVIEW / PASS |
 | New member (`--profile.check-join`) | CAS, then jev | no | yes (and photo) | BAN / REVIEW / PASS |
 
+### What jev is asked: where the spam rules live
+
+There is no hidden prompt. Everything the model sees is in two places, and both are plain text you can edit:
+
+| What | Where | Form |
+|------|-------|------|
+| Wording of every question (what counts as spam, ad profile, bait ...) | [`app/profile/criteria.yml`](app/profile/criteria.yml), built into the binary; replace with `--jev.criteria-file=FILE` | YAML: per question `instructions` plus the criteria (classes, true/false descriptions, score levels) |
+| What the model is told about this event | built per event in [`app/profile/questions.go`](app/profile/questions.go) | JSON `state`: event kind, post text, comment, user (name, bio, personal channel with last posts), avatars as images |
+| Which answers become BAN / REVIEW / PASS | [`app/profile/decide.go`](app/profile/decide.go), thresholds `--jev.th.*` | Go, about 30 lines, no model involved |
+| Stock tg-spam jev text check (only if `--jev.token` is set) | `--jev.question`, `--jev.criteria-spam`, `--jev.criteria-ham` | plain strings, see `--help` |
+
+Questions asked in one jev call (a question is skipped when it has nothing to look at: no comment, no bio, no avatars):
+
+| Question | Type | Asks | Asked for |
+|----------|------|------|-----------|
+| `comment_class` | choice | `ok`, `job_scam`, `adult`, `drugs`, `invest_scam`, `other_ad`: what kind of comment is this (the text only, not the author) | comments |
+| `comment_relevance` | score | how tied is the comment to the channel post: 0 generic template ("Wow, so interesting!"), 1 specific to the post | comments under a post |
+| `bait` | yes/no | is the comment empty of meaning and written only to make readers open the author's profile | comments |
+| `profile_adult`, `profile_drugs`, `profile_scam` | yes/no | does the bio, personal channel or avatar advertise escort or adult dating, drugs, easy earnings or casino and crypto schemes | everything with a non-empty profile |
+| `photo_provocative` | yes/no | are the avatars provocative or explicit | everything with avatars |
+
+One of the questions, as it is written in `criteria.yml`:
+
+```yaml
+profile_drugs:
+  instructions: >-
+    Does the profile of `user` (bio, personal channel, avatars in `profile_photos`) advertise prohibited substances?
+  true: >-
+    The bio or channel sells or promotes drugs: "закладки", "мефедрон", "шишки", "доставка", "в наличии", menus,
+    prices of substances, links to shops of such goods.
+  false: >-
+    No sign of selling prohibited substances. Mentions of medicine, pharmacy, coffee or tea shops are fine.
+```
+
+jev answers with a probability per question. The rules turn them into an action (`profile ads` is the highest of `profile_adult`, `profile_drugs`, `profile_scam`), top to bottom, the first match wins:
+
+| # | Condition | Default | Action |
+|---|-----------|---------|--------|
+| 1 | `comment_class` is not `ok` with probability at least `--jev.th.comment-ban` | 0.90 | BAN |
+| 2 | profile ads at least `--jev.th.profile-ban` **and** one of: it is a reaction; the comment is generic (`comment_relevance` at most 0.5); `bait` at least `--jev.th.bait` (0.70); on a join, `photo_provocative` at least `--jev.th.photo` | 0.85 | BAN |
+| 3 | `comment_class` spam probability at least `--jev.th.comment-review` | 0.60 | REVIEW |
+| 4 | profile ads between `--jev.th.profile-review` and `--jev.th.profile-ban` | 0.60 | REVIEW |
+| 5 | `photo_provocative` at least `--jev.th.photo` with a generic comment | 0.85 | REVIEW |
+| 6 | an ad-like profile with a specific, on-topic comment | | PASS (an ad in the bio alone is not a reason to punish a real reader) |
+| 7 | nothing fired | | PASS |
+
+Every decision stores all the probabilities, so the admin card and `--profile.export-csv` show *why* a user was banned. Changing the wording in `criteria.yml` changes what a threshold means: re-run `--dry` after every edit. `go test -tags live -run TestLiveJev ./app/profile` sends synthetic cases (job scam, escort bio, drug shop bio, ordinary readers) to the real API and fails if any lands in the wrong action; add your own cases there.
+
+### Cost
+
+jev is billed per token. The price used here, **$0.042 per million tokens**, comes from the project specification, not from a current price list: check it with typesafe.ai before budgeting. The bot counts tokens itself (input plus output, priced at the input rate) and logs an hourly line with `tokens` and `estimated cost`.
+
+Measured on the real API (`jev-1.14.0`, 8 synthetic cases, one 640x640 avatar):
+
+| Case | Tokens per check |
+|------|------------------|
+| Comment, empty profile, no avatar | 1,200 to 1,700 |
+| Reaction, short bio, no avatar | about 850 |
+| Reaction, bio and one avatar | about 2,050 |
+| Comment, bio and one avatar | about 2,900 |
+| One avatar | about 1,200 of the above |
+| Three avatars (extrapolated, not measured) | about 4,500 to 5,000 |
+
+Latency in the same run: 215 to 345 ms per call. The profile photos are the main cost: the text of the comment and the questions together are about 1,000 tokens.
+
+Cost per day for **checked events** at $0.042 per million tokens:
+
+| Checked events per day | Mostly no avatars (1.2k tokens) | One avatar (2.4k) | Three avatars (4.8k) |
+|------------------------|------|------|------|
+| 1,000 | $0.05 per day, $1.5 per month | $0.10, $3.0 | $0.20, $6.0 |
+| 10,000 | $0.50 per day, $15 per month | $1.00, $30 | $2.00, $60 |
+
+What counts as a checked event: only comments, reactions and joins of users who are **not approved yet** and whose text tg-spam found clean. A user becomes approved after a clean message of at least `--min-msg-len` characters, so regulars cost nothing; a user who only writes short comments is checked on each of them. With 1,000 comments a day, if 30% come from users who are not approved, the bill is 300 checks: about a third of the first row. The upper rows are the worst case where every comment is checked. The dossier itself (Telegram API) is free and cached for `--profile.cache-ttl`; CAS is free but needs a token.
+
+Not included: the stock tg-spam jev text check enabled by the same `--jev.token` (text only, about the size of the comment, not measured here), the server (the bot is one small Go process with SQLite), and any volume discount or rate limit on the jev side (not checked). To measure your own traffic, run with `--dry` for a few days and read the hourly log line: it prints tokens and estimated cost for the period.
+
 ### Quick start
 
 ```bash
