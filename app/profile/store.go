@@ -35,6 +35,8 @@ const (
 	cmdStatsLatency
 	cmdStatsOpenReviews
 	cmdExport
+	cmdRemoveReview
+	cmdAbandonReviews
 )
 
 const decisionColumns = "id, user_id, chat_id, message_id, event_type, cas_hit, jev_model, jev_answers, tokens_used, " +
@@ -100,7 +102,11 @@ var storeQueries = engine.NewQueryMap().
 	AddSame(cmdExport, `SELECT d.id, d.user_id, d.chat_id, d.message_id, d.event_type, d.cas_hit, d.jev_model, d.jev_answers,
         d.tokens_used, d.action, d.reason, d.latency_ms, d.created_at, COALESCE(r.verdict, ''), COALESCE(r.admin_id, 0),
         r.created_at FROM profile_decisions d LEFT JOIN profile_reviews r ON r.decision_id = d.id
-        WHERE d.gid = ? ORDER BY d.id`)
+        WHERE d.gid = ? ORDER BY d.id`).
+	AddSame(cmdRemoveReview, `DELETE FROM profile_reviews WHERE gid = ? AND decision_id = ?`).
+	AddSame(cmdAbandonReviews, `UPDATE profile_decisions SET action = 'skip', reason = reason || ?
+        WHERE gid = ? AND user_id = ? AND id >= ? AND action = 'review'
+        AND id NOT IN (SELECT decision_id FROM profile_reviews WHERE gid = ?)`)
 
 // Record is a stored decision
 type Record struct {
@@ -117,9 +123,10 @@ type Record struct {
 	Reason     string    `db:"reason"`
 	LatencyMS  int       `db:"latency_ms"`
 	CreatedAt  time.Time `db:"created_at"`
+	UserName   string    `db:"-"` // from the cached dossier, empty when it is gone
 }
 
-// Stats summarises decisions since a moment
+// Stats summarizes decisions since a moment
 type Stats struct {
 	Total, Pass, Review, Ban, Skip int
 	Tokens                         int
@@ -242,6 +249,30 @@ func (s *Store) AddReview(ctx context.Context, decisionID, adminID int64, v Verd
 	return n > 0, err //nolint:wrapcheck // driver error is self-explanatory
 }
 
+// RemoveReview deletes the verdict of a decision, so the next press of a card button acts again
+func (s *Store) RemoveReview(ctx context.Context, decisionID int64) error {
+	return s.exec(ctx, cmdRemoveReview, s.GID(), decisionID)
+}
+
+// AbandonReviews turns the unanswered reviews of the user, from the decision on, into skips and appends the note
+// to their reasons
+func (s *Store) AbandonReviews(ctx context.Context, userID, fromDecisionID int64, note string) error {
+	return s.exec(ctx, cmdAbandonReviews, note, s.GID(), userID, fromDecisionID, s.GID())
+}
+
+func (s *Store) exec(ctx context.Context, cmd engine.DBCmd, args ...any) error {
+	q, err := s.query(cmd)
+	if err != nil {
+		return err
+	}
+	s.Lock()
+	defer s.Unlock()
+	if _, err = s.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("failed to update profile store: %w", err)
+	}
+	return nil
+}
+
 // HasOpenReview tells if an older review decision of the user, made since the moment, has no answer yet. Only older ones
 // count, so of two decisions made together exactly the first one gets a card.
 func (s *Store) HasOpenReview(ctx context.Context, userID, beforeDecisionID int64, since time.Time) (bool, error) {
@@ -267,7 +298,7 @@ func (s *Store) count(ctx context.Context, cmd engine.DBCmd, args ...any) (bool,
 	return n > 0, nil
 }
 
-// Stats summarises decisions since the moment; reviews older than reviewTimeout count as open
+// Stats summarizes decisions since the moment; reviews older than reviewTimeout count as open
 func (s *Store) Stats(ctx context.Context, since time.Time, reviewTimeout time.Duration) (Stats, error) {
 	var st Stats
 	s.RLock()

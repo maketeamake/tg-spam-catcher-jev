@@ -11,9 +11,9 @@ A fork of [umputun/tg-spam](https://github.com/umputun/tg-spam) (MIT) that adds 
 In plain words:
 
 1. **tg-spam goes first.** Everything upstream tg-spam does still works. The profile check runs only on messages it found clean, from users who are not approved yet.
-2. **Read the profile.** The bot reads the sender's public profile through the Bot API (bio, personal channel with its last posts, up to three avatars) and caches it for 7 days (a returning user only gets a cheap re-check of name and first avatar).
+2. **Read the profile.** The bot reads the sender's public profile through the Bot API (bio, personal channel with its last posts, up to three avatars) and caches it for 7 days (a returning user only gets a cheap re-check of name, bio, personal channel and first avatar; a profile that could not be read in full is not cached).
 3. **Ask jev once.** The dossier, the comment and the channel post go to jev in a single request with typed questions. jev returns numbers (probabilities), not prose.
-4. **Decide with fixed rules, not with a model.** A spam-class comment bans on its own. An ad-like profile bans only when something backs it up: a reaction (a reaction has no text, so the profile is all there is), a generic template comment, a bait comment, or on a join a provocative photo. Weaker signals go to a human (REVIEW). The rules are in [`app/profile/decide.go`](app/profile/decide.go), the thresholds are `--jev.th.*` options.
+4. **Decide with fixed rules, not with a model.** A spam-class comment bans on its own. An ad-like profile bans only when something backs it up: a reaction (a reaction has no text, so the profile is all there is), a generic template comment, a bait comment, or on a join a provocative photo. Weaker signals, and an ad-like profile with nothing to back it up, go to a human (REVIEW). The rules are in [`app/profile/decide.go`](app/profile/decide.go), the thresholds are `--jev.th.*` options.
 5. **A human has the last word.** Every BAN and REVIEW posts a card to the admin chat with inline buttons. A wrong decision is one click away from being undone, and the click also teaches the bot to trust that user.
 6. **Failures are safe.** If jev is down, slow or answers garbage, the result is SKIP: no sanction is ever based on a failed call. A full queue drops the event with a warning instead of stalling the bot.
 
@@ -64,10 +64,9 @@ jev answers with a probability per question. The rules turn them into an action 
 | 1 | `comment_class` is not `ok` with probability at least `--jev.th.comment-ban` | 0.90 | BAN |
 | 2 | profile ads at least `--jev.th.profile-ban` **and** one of: it is a reaction; the comment is generic (`comment_relevance` at most 0.5); `bait` at least `--jev.th.bait` (0.70); on a join, `photo_provocative` at least `--jev.th.photo` | 0.85 | BAN |
 | 3 | `comment_class` spam probability at least `--jev.th.comment-review` | 0.60 | REVIEW |
-| 4 | profile ads between `--jev.th.profile-review` and `--jev.th.profile-ban` | 0.60 | REVIEW |
+| 4 | profile ads at least `--jev.th.profile-review` (rule 2 did not ban: nothing backs the profile up) | 0.60 | REVIEW |
 | 5 | `photo_provocative` at least `--jev.th.photo` with a generic comment | 0.85 | REVIEW |
-| 6 | an ad-like profile with a specific, on-topic comment | | PASS (an ad in the bio alone is not a reason to punish a real reader) |
-| 7 | nothing fired | | PASS |
+| 6 | nothing fired | | PASS |
 
 Every decision stores all the probabilities, so the admin card and `--profile.export-csv` show *why* a user was banned. Changing the wording in `criteria.yml` changes what a threshold means: re-run `--dry` after every edit. `go test -tags live -run TestLiveJev ./app/profile` sends synthetic cases (job scam, escort bio, drug shop bio, ordinary readers) to the real API and fails if any lands in the wrong action; add your own cases there.
 
@@ -115,7 +114,7 @@ Set `PROFILE_DRY=false` when the cards in the admin chat look right. All options
 - Thresholds are defaults from a small test, not calibrated on production traffic. Run `--dry` and read `--profile.export-csv` before enforcing.
 - `--jev.token` also enables the stock tg-spam jev text check (threshold 0.30, messages of at least `--min-msg-len` characters). Raise `--jev.threshold` to 0.95 if you want the profile layer alone.
 - A join is taken from the `new_chat_members` service message, not from `chat_member` updates.
-- The profile options are command line and environment only: no web settings page, no DB-backed config.
+- The profile options are not on the web settings page. With `--confdb` they are stored by `save-config` and read from the database like the other options.
 - Not verified: Postgres storage, the docker image build, real avatars and the join check on live Telegram.
 
 ### Credits and license
@@ -279,12 +278,12 @@ Setting `--jev.token [$JEV_TOKEN]` enables [jev](https://docs.typesafe.ai), a de
 `--profile.enabled` adds a second line of defence for channel comments: after tg-spam finds a message clean, the sender's profile dossier (name, bio, personal channel and its last posts, up to `--profile.photos-limit` avatars) is read and jev is asked about the comment and the profile together. The rules are in `docs/TZ_antispam_bot.md` section 5.3 and `docs/profile-check-plan.md`; the thresholds are the `--jev.th.*` options and the question wording is `app/profile/criteria.yml` (override with `--jev.criteria-file`). Changing either invalidates the calibration.
 
 - Needs `--jev.token`, and `--admin.group` unless `--dry` or `--training` is set: a REVIEW result restricts the user until an admin answers, so without an admin chat nobody could release them.
-- Events: a comment of a non-approved user, a reaction of a non-approved user (CAS and profile only, nothing to delete), and with `--profile.check-join` a new member. CAS is always checked on a reaction or a join. Approved users never reach jev.
-- Results: BAN deletes the comment and bans the user (in `--soft-ban` mode only restricts); REVIEW deletes the comment and restricts the user; PASS and SKIP change nothing. An unreachable or malformed jev answer is SKIP, never a sanction. The admin card carries the avatar, the profile, the reason and buttons: "Ban" / "Not spam" for REVIEW, "Unban" for BAN. Cards are sent in `--dry` and `--training` mode too, but nothing is deleted, banned, restricted or lifted, buttons included.
-- Dossiers are cached by user id for `--profile.cache-ttl`; on a cache hit the name, username and the first avatar are re-checked, so a changed profile is read again. Avatars are kept in memory only.
+- Events: a comment of a non-approved user, a reaction of a non-approved user (CAS and profile only, nothing to delete), and with `--profile.check-join` a new member. CAS is checked on a reaction or a join when `--cas.api` and `--cas.token` are set. Approved users never reach jev.
+- Results: BAN deletes the comment and bans the user (in `--soft-ban` mode only restricts); REVIEW deletes the comment and restricts the user; PASS and SKIP change nothing. An unreachable or malformed jev answer is SKIP, never a sanction. The admin card carries the avatar, the profile, the reason and buttons: "Ban" / "Not spam" for REVIEW, "Unban" for BAN. Cards are sent in `--dry` and `--training` mode too, but nothing is deleted, banned, restricted or lifted, buttons included. If a button action fails in Telegram, the verdict is taken back and the buttons stay, so pressing again retries it, also after a restart. If a review card cannot be sent at all, the restriction is lifted, since nobody could release the user.
+- Dossiers are cached by user id for `--profile.cache-ttl`; on a cache hit the name, username, bio, personal channel and first avatar are re-checked, so a changed profile is read again. A dossier with a part that could not be read is not cached, and a profile that could not be read at all is SKIP, not PASS. Avatars are kept in memory only.
 - Work runs on `--profile.workers` workers and a bounded queue; when the queue is full the event is dropped with a warning and the update loop never blocks. The p95 of 3 s from the specification holds on dossier cache hits, a first sight of a user may take longer.
 - Statistics: an hourly log line, and `--profile.export-csv=FILE` writes every decision with the admin verdict and exits.
-- Not wired into the DB-backed settings, the web settings page or the e2e UI test: these options are command line and environment only.
+- Not on the web settings page and not in the e2e UI test. With `--confdb` the options are stored by `save-config` and loaded from the database like every other option, and validated on save the same way as at startup; `--profile.export-csv` is a command and always comes from the command line.
 - Deviation from the specification: a join is taken from the `new_chat_members` service message, not from `chat_member` updates.
 
 **LLM consensus**

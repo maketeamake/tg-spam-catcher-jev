@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/umputun/tg-spam/app/profile"
 	"github.com/umputun/tg-spam/app/storage"
 	"github.com/umputun/tg-spam/lib/tgspam"
 )
@@ -391,7 +392,29 @@ func (s *Settings) validateProfile() error {
 	if s.Profile.ReviewTimeout <= 0 {
 		return fmt.Errorf("profile.review-timeout (%v) must be positive", s.Profile.ReviewTimeout)
 	}
-	return nil
+	cfg, err := s.ProfileConfig()
+	if err != nil {
+		return err
+	}
+	return cfg.Validate() //nolint:wrapcheck // the message names the option already
+}
+
+// ProfileConfig builds the config of the profile check. Startup and validation both read it from here, so a config
+// accepted at save time is the one the next start constructs.
+func (s *Settings) ProfileConfig() (profile.Config, error) {
+	criteria, err := profile.LoadCriteria(s.Profile.CriteriaFile)
+	if err != nil {
+		return profile.Config{}, fmt.Errorf("can't load profile criteria: %w", err)
+	}
+	return profile.Config{
+		CacheTTL: s.Profile.CacheTTL, CASNegativeTTL: profile.DefaultCASNegativeTTL,
+		PhotosLimit: s.Profile.PhotosLimit, PersonalPostsLimit: s.Profile.PersonalPostsLimit,
+		CheckJoin: s.Profile.CheckJoin, ReviewTimeout: s.Profile.ReviewTimeout, Criteria: criteria,
+		Jev: profile.JevConfig{Token: s.Jev.Token, APIBase: s.Jev.APIBase, Model: s.Profile.Model, Timeout: s.Profile.Timeout},
+		Thresholds: profile.Thresholds{CommentBan: s.Profile.CommentBan, CommentReview: s.Profile.CommentReview,
+			ProfileBan: s.Profile.ProfileBan, ProfileReview: s.Profile.ProfileReview, Bait: s.Profile.Bait,
+			Photo: s.Profile.Photo},
+	}, nil
 }
 
 // validateJev enforces the same contract newJevChecker does, gated on the same predicate the

@@ -946,3 +946,35 @@ func TestSettings_JevLegacyStoredSettingsTakeTemplateDefaults(t *testing.T) {
 	assert.InDelta(t, 0.3, legacy.Jev.Threshold, 0.0001)
 	require.NoError(t, legacy.Validate())
 }
+
+func TestSettings_ValidateProfile(t *testing.T) {
+	valid := func() *Settings {
+		s := New()
+		s.Dry = true
+		s.Jev.Token = "token"
+		s.Profile = ProfileSettings{Enabled: true, CacheTTL: time.Hour, PhotosLimit: 3, PersonalPostsLimit: 5,
+			ReviewTimeout: time.Hour, Workers: 4, Model: "jev-1.14.0", Timeout: 3 * time.Second,
+			CommentBan: 0.9, CommentReview: 0.6, ProfileBan: 0.85, ProfileReview: 0.6, Bait: 0.7, Photo: 0.85}
+		return s
+	}
+	require.NoError(t, valid().validateProfile())
+
+	tests := []struct {
+		name   string
+		change func(s *Settings)
+	}{
+		{"review above ban", func(s *Settings) { s.Profile.CommentReview = 0.95 }},
+		{"nan threshold", func(s *Settings) { s.Profile.Photo = math.NaN() }},
+		{"zero cache ttl", func(s *Settings) { s.Profile.CacheTTL = 0 }},
+		{"too many photos", func(s *Settings) { s.Profile.PhotosLimit = 11 }},
+		{"missing criteria file", func(s *Settings) { s.Profile.CriteriaFile = "no-such-file.yml" }},
+		{"no admin group outside dry run", func(s *Settings) { s.Dry = false }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := valid()
+			tt.change(s)
+			assert.Error(t, s.validateProfile(), "a config that would not start must not be saved")
+		})
+	}
+}

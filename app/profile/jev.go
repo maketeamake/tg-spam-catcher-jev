@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"strings"
 	"time"
 )
 
@@ -20,7 +19,8 @@ const (
 	DefaultJevModel   = "jev-1.14.0"
 	DefaultJevTimeout = 3 * time.Second
 
-	maxJevResponse = 1 << 20
+	maxJevResponse    = 1 << 20
+	maxErrorBodyRunes = 300 // an error body of jev goes to logs and the decision reason
 )
 
 // JevConfig is the connection to the jev decision API
@@ -171,7 +171,7 @@ func (c *jevClient) ask(ctx context.Context, r Request) (Response, error) {
 		return Response{}, fmt.Errorf("can't read jev response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return Response{}, &HTTPError{Status: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+		return Response{}, &HTTPError{Status: resp.StatusCode, Body: trunc(string(data), maxErrorBodyRunes)}
 	}
 	var out Response
 	if err := json.Unmarshal(data, &out); err != nil {

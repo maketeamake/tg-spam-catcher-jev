@@ -345,6 +345,7 @@ func main() {
 		appSettings.Transient.TGDbg = opts.TGDbg
 		appSettings.Transient.StorageTimeout = opts.StorageTimeout
 		appSettings.Transient.LuaUnrestricted = opts.LuaPlugins.Unrestricted
+		appSettings.Profile.ExportCSV = opts.Profile.ExportCSV // a one-shot command, never stored
 
 		// apply explicit CLI overrides for non-transient values
 		applyCLIOverrides(appSettings, opts, defaults)

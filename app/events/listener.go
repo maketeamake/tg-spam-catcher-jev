@@ -39,8 +39,9 @@ func (f SpamLoggerFunc) Save(msg *bot.Message, response *bot.Response) {
 	f(msg, response)
 }
 
-// TelegramListener listens to tg update, forward to bots and send back responses
-// Not thread safe
+// TelegramListener listens to tg update, forward to bots and send back responses.
+// Do is not safe to call concurrently. Profile check workers use TbAPI, Bot, Locator and SpamLogger from
+// their own goroutines, so those must be safe for concurrent use.
 type TelegramListener struct {
 	TbAPI                   TbAPI          // telegram bot API
 	SpamLogger              SpamLogger     // logger to save spam to files and db
@@ -79,8 +80,7 @@ type TelegramListener struct {
 	adminChatID     int64
 	linkedChannelID int64 // channel linked to the discussion group, resolved at startup
 	profileJobs     chan func(context.Context)
-	profileRetry    sync.Map // decision id -> button of a failed card action, pressing it again repeats the action
-	profileBanned   sync.Map // user id -> time of the last profile ban, hides the cards of a burst of comments
+	profileBanned   sync.Map // user id -> time of a profile ban card, hides more cards of the same burst for a minute
 
 	msgs struct {
 		once sync.Once

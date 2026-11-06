@@ -61,6 +61,7 @@ type Dossier struct {
 	Channel   *Channel   `json:"personal_channel,omitempty"`
 	Photos    []PhotoRef `json:"photos,omitempty"`
 	FetchedAt time.Time  `json:"fetched_at"`
+	Partial   bool       `json:"partial,omitempty"` // a part could not be read, the dossier is not cached
 }
 
 // Empty is true when the profile has nothing for the model to judge: no bio, channel or avatar
@@ -90,11 +91,10 @@ func (d *Dossier) PhotoIDs() []string {
 
 // collector builds dossiers from Telegram
 type collector struct {
-	tg         TG
-	http       HTTPDoer
-	photos     int
-	posts      int
-	postsLimit int
+	tg     TG
+	http   HTTPDoer
+	photos int
+	posts  int
 }
 
 // fetch reads the profile. A part that cannot be read is skipped, the dossier is then partial.
@@ -106,10 +106,11 @@ func (c *collector) fetch(ctx context.Context, u User) *Dossier {
 	})
 	if err != nil {
 		log.Printf("[DEBUG] profile: can't get chat info of %d: %v", u.ID, err)
+		d.Partial = true
 	} else {
 		d.Bio = trunc(info.Bio, maxBioRunes)
 		if pc := info.PersonalChat; pc != nil {
-			d.Channel = c.fetchChannel(ctx, u.ID, pc)
+			d.Channel = c.fetchChannel(ctx, d, pc)
 		}
 	}
 
@@ -119,29 +120,35 @@ func (c *collector) fetch(ctx context.Context, u User) *Dossier {
 		})
 		if err != nil {
 			log.Printf("[DEBUG] profile: can't get photos of %d: %v", u.ID, err)
+			d.Partial = true
 		}
 		for _, sizes := range photos.Photos {
 			if best, ok := pickSize(sizes); ok {
-				d.Photos = append(d.Photos, PhotoRef{FileID: best.FileID, UniqueID: best.FileUniqueID, Width: best.Width, Height: best.Height})
+				d.Photos = append(d.Photos, PhotoRef{FileID: best.FileID, UniqueID: best.FileUniqueID, Width: best.Width,
+					Height: best.Height})
 			}
 		}
 	}
 	return d
 }
 
-func (c *collector) fetchChannel(ctx context.Context, userID int64, pc *tbapi.Chat) *Channel {
+func (c *collector) fetchChannel(ctx context.Context, d *Dossier, pc *tbapi.Chat) *Channel {
 	ch := &Channel{Title: pc.Title, Username: pc.UserName}
-	if info, err := callCtx(ctx, func() (tbapi.ChatFullInfo, error) {
+	info, err := callCtx(ctx, func() (tbapi.ChatFullInfo, error) {
 		return c.tg.GetChat(tbapi.ChatInfoConfig{ChatConfig: tbapi.ChatConfig{ChatID: pc.ID}})
-	}); err == nil {
+	})
+	if err != nil {
+		d.Partial = true
+	} else {
 		ch.Description = trunc(info.Description, maxChannelDescRunes)
 	}
 	if c.posts > 0 {
 		msgs, err := callCtx(ctx, func() ([]tbapi.Message, error) {
-			return c.tg.GetUserPersonalChatMessages(tbapi.UserPersonalChatMessagesConfig{UserID: userID, Limit: c.posts})
+			return c.tg.GetUserPersonalChatMessages(tbapi.UserPersonalChatMessagesConfig{UserID: d.User.ID, Limit: c.posts})
 		})
 		if err != nil {
-			log.Printf("[DEBUG] profile: can't get personal channel posts of %d: %v", userID, err)
+			log.Printf("[DEBUG] profile: can't get personal channel posts of %d: %v", d.User.ID, err)
+			d.Partial = true
 		}
 		for _, m := range msgs {
 			text := m.Text
@@ -156,9 +163,16 @@ func (c *collector) fetchChannel(ctx context.Context, userID int64, pc *tbapi.Ch
 	return ch
 }
 
-// stillFresh tells if a cached dossier still matches the user: same names and the same first avatar
+// stillFresh tells if a cached dossier still matches the user: same names, bio, personal channel and first avatar.
+// Posts of the personal channel are not compared, they are read again when the cache expires.
 func (c *collector) stillFresh(ctx context.Context, d *Dossier, u User) bool {
 	if d.User.FirstName != u.FirstName || d.User.LastName != u.LastName || d.User.Username != u.Username {
+		return false
+	}
+	info, err := callCtx(ctx, func() (tbapi.ChatFullInfo, error) {
+		return c.tg.GetChat(tbapi.ChatInfoConfig{ChatConfig: tbapi.ChatConfig{ChatID: u.ID}})
+	})
+	if err == nil && (trunc(info.Bio, maxBioRunes) != d.Bio || channelChanged(info.PersonalChat, d.Channel)) {
 		return false
 	}
 	photos, err := callCtx(ctx, func() (tbapi.UserProfilePhotos, error) {
@@ -175,6 +189,13 @@ func (c *collector) stillFresh(ctx context.Context, d *Dossier, u User) bool {
 		return true // the first avatar is unusable either way
 	}
 	return len(d.Photos) > 0 && d.Photos[0].UniqueID == best.FileUniqueID
+}
+
+func channelChanged(pc *tbapi.Chat, ch *Channel) bool {
+	if pc == nil || ch == nil {
+		return (pc == nil) != (ch == nil)
+	}
+	return pc.Title != ch.Title || pc.UserName != ch.Username
 }
 
 // download loads the avatars into memory. Pictures that can't be loaded are skipped.
@@ -269,7 +290,7 @@ func callCtx[T any](ctx context.Context, f func() (T, error)) (T, error) {
 		return r.v, r.err
 	case <-ctx.Done():
 		var zero T
-		return zero, ctx.Err()
+		return zero, fmt.Errorf("telegram call abandoned: %w", ctx.Err())
 	}
 }
 

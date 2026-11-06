@@ -120,7 +120,8 @@ type Config struct {
 	Criteria           *Criteria
 }
 
-// Validate checks the config and fills nothing in; use DefaultConfig for the starting values
+// Validate checks the config. Only the jev api base gets a default when empty; use DefaultConfig for the other
+// starting values
 func (c *Config) Validate() error {
 	if c.CacheTTL <= 0 {
 		return fmt.Errorf("profile cache ttl (%v) must be positive", c.CacheTTL)
@@ -150,8 +151,9 @@ func DefaultConfig() (Config, error) {
 		return Config{}, err
 	}
 	return Config{
-		CacheTTL: 7 * 24 * time.Hour, CASNegativeTTL: DefaultCASNegativeTTL, PhotosLimit: 3, PersonalPostsLimit: 5, ReviewTimeout: 24 * time.Hour,
-		Jev: JevConfig{Model: DefaultJevModel, Timeout: DefaultJevTimeout}, Thresholds: DefaultThresholds(), Criteria: crit,
+		CacheTTL: 7 * 24 * time.Hour, CASNegativeTTL: DefaultCASNegativeTTL, PhotosLimit: 3, PersonalPostsLimit: 5,
+		ReviewTimeout: 24 * time.Hour, Jev: JevConfig{Model: DefaultJevModel, Timeout: DefaultJevTimeout},
+		Thresholds: DefaultThresholds(), Criteria: crit,
 	}, nil
 }
 

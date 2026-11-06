@@ -66,7 +66,8 @@ func NewService(cfg Config, tg TG, store *Store, cas CASFunc, jevHTTP HTTPDoer) 
 	}
 	return &Service{
 		cfg: cfg, jev: jev, store: store, cas: cas,
-		col:      &collector{tg: tg, http: &http.Client{Timeout: 10 * time.Second}, photos: cfg.PhotosLimit, posts: cfg.PersonalPostsLimit},
+		col: &collector{tg: tg, http: &http.Client{Timeout: 10 * time.Second}, photos: cfg.PhotosLimit,
+			posts: cfg.PersonalPostsLimit},
 		dossiers: cache.NewCache[int64, *Dossier]().WithMaxKeys(maxCacheUsers).WithTTL(cfg.CacheTTL),
 		verdicts: cache.NewCache[int64, cachedVerdict]().WithMaxKeys(maxCacheUsers).WithTTL(cfg.CacheTTL),
 		casCache: cache.NewCache[int64, bool]().WithMaxKeys(maxCacheUsers * 5).WithTTL(foreverTTL),
@@ -88,9 +89,21 @@ func (s *Service) PostText(msgID int) string {
 }
 
 // Check runs the whole check of an event and stores the decision. It never returns a sanction for a failed check.
+// Checks of one user run one after another, so a burst reuses the first answer about the profile. An event without
+// text (a reaction, a join) is skipped while another check of the same user runs: there is nothing of its own to
+// judge or delete, and a burst of them must not occupy every worker.
 func (s *Service) Check(ctx context.Context, ev Event) Result {
 	start := time.Now()
-	defer s.locks.lock(ev.User.ID)()
+	var unlock func()
+	if ev.Kind == KindComment {
+		unlock = s.locks.lock(ev.User.ID)
+	} else {
+		var ok bool
+		if unlock, ok = s.locks.tryLock(ev.User.ID); !ok {
+			return Result{Action: ActionSkip, Reason: "another check of this user is running"}
+		}
+	}
+	defer unlock()
 	ctx, cancel := context.WithTimeout(ctx, checkDeadline)
 	defer cancel()
 
@@ -105,9 +118,9 @@ func (s *Service) Check(ctx context.Context, ev Event) Result {
 			answers = string(b)
 		}
 	}
-	id, err := s.store.AddDecision(sctx, Record{UserID: ev.User.ID, ChatID: ev.ChatID, MessageID: ev.MessageID, EventType: string(ev.Kind),
-		CASHit: res.CASHit, JevModel: res.Model, JevAnswers: answers, TokensUsed: res.Tokens, Action: string(res.Action),
-		Reason: res.Reason, LatencyMS: int(res.Latency.Milliseconds())})
+	id, err := s.store.AddDecision(sctx, Record{UserID: ev.User.ID, ChatID: ev.ChatID, MessageID: ev.MessageID,
+		EventType: string(ev.Kind), CASHit: res.CASHit, JevModel: res.Model, JevAnswers: answers, TokensUsed: res.Tokens,
+		Action: string(res.Action), Reason: res.Reason, LatencyMS: int(res.Latency.Milliseconds())})
 	if err != nil {
 		log.Printf("[WARN] profile: can't store decision for %d: %v", ev.User.ID, err)
 		if res.Action == ActionBan || res.Action == ActionReview { // the card buttons would point to nothing
@@ -148,10 +161,13 @@ func (s *Service) check(ctx context.Context, ev Event) checked {
 	profileQ := !d.Empty()
 	if commentText == "" && !profileQ {
 		res.Reason = "nothing to judge"
+		if d.Partial { // the profile was not read, an empty one would be a guess
+			res.Action, res.Reason = ActionSkip, "profile could not be read"
+		}
 		return res
 	}
 
-	profileOnly := ev.Kind != KindComment
+	profileOnly := commentText == ""
 	if profileOnly { // reuse the profile answers while the profile did not change
 		if v, ok := s.verdicts.Get(ev.User.ID); ok && v.fingerprint == d.Fingerprint() {
 			res.Scores, res.Model = v.scores, v.model
@@ -184,7 +200,7 @@ func (s *Service) check(ctx context.Context, ev Event) checked {
 	res.Scores, res.Model, res.Tokens = scores, resp.Model, resp.Usage.InputTokens+resp.Usage.OutputTokens
 	res.answers = resp.Answers
 	res.Action, res.Reason = Decide(ev.Kind, scores, s.cfg.Thresholds)
-	if profileOnly {
+	if profileOnly && len(images) == len(d.Photos) { // answers without some avatars must not stand for the full profile
 		s.verdicts.Set(ev.User.ID, cachedVerdict{fingerprint: d.Fingerprint(), scores: scores, model: resp.Model}, 0)
 	}
 	return res
@@ -198,7 +214,8 @@ func (s *Service) ask(ctx context.Context, r Request) (Response, map[string]Ques
 	switch {
 	case err == nil:
 		return resp, r.Questions, nil
-	case errors.As(err, &he) && (he.Status == http.StatusBadRequest || he.Status == http.StatusRequestEntityTooLarge) && len(r.Images) > 0:
+	case errors.As(err, &he) && len(r.Images) > 0 &&
+		(he.Status == http.StatusBadRequest || he.Status == http.StatusRequestEntityTooLarge):
 		log.Printf("[WARN] profile: jev rejected the request with images, retrying without them: %v", err)
 		r = stripImages(r)
 		resp, err = s.jev.ask(ctx, r)
@@ -233,7 +250,9 @@ func (s *Service) dossier(ctx context.Context, u User) *Dossier {
 		return d
 	}
 	d := s.col.fetch(dctx, u)
-	s.dossiers.Set(u.ID, d, 0)
+	if !d.Partial { // a part missing because of a slow call is read again next time
+		s.dossiers.Set(u.ID, d, 0)
+	}
 	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), storeTimeout)
 	defer scancel()
 	if err := s.store.SaveDossier(sctx, d); err != nil {
@@ -271,14 +290,33 @@ func (s *Service) Resolve(ctx context.Context, decisionID, adminID int64, v Verd
 	if v == VerdictHam {
 		s.verdicts.Invalidate(rec.UserID)
 	}
+	if d, ok := s.dossiers.Get(rec.UserID); ok {
+		rec.UserName = d.User.Username
+		if rec.UserName == "" {
+			rec.UserName = strings.TrimSpace(d.User.FirstName + " " + d.User.LastName)
+		}
+	}
 	return rec, first, nil
+}
+
+// Unresolve removes the verdict of a decision whose action failed, so a press of any card button acts again,
+// also after a restart
+func (s *Service) Unresolve(ctx context.Context, decisionID int64) error {
+	return s.store.RemoveReview(ctx, decisionID)
+}
+
+// Abandon turns a review whose card could not be sent into a skip, together with the later unanswered reviews of the
+// user it kept from getting a card, so none of them hides the cards of the next reviews
+func (s *Service) Abandon(ctx context.Context, userID, decisionID int64, why string) error {
+	return s.store.AbandonReviews(ctx, userID, decisionID, " ("+why+")")
 }
 
 // Cleared tells if an admin marked the user "not spam" since the moment, so a slower check must not sanction them
 func (s *Service) Cleared(ctx context.Context, userID int64, since time.Time) bool {
 	ok, err := s.store.AdminCleared(ctx, userID, since)
 	if err != nil {
-		log.Printf("[WARN] profile: can't check admin verdicts for %d: %v", userID, err)
+		log.Printf("[WARN] profile: can't check admin verdicts for %d, no sanction: %v", userID, err)
+		return true
 	}
 	return ok
 }
@@ -333,7 +371,7 @@ func (s *Service) Run(ctx context.Context, interval, reviewTimeout time.Duration
 	}
 }
 
-// keyedLock serialises work per key, a second event of the same user waits for the first
+// keyedLock serializes work per key, a second event of the same user waits for the first
 type keyedLock struct {
 	mu sync.Mutex
 	m  map[int64]*lockEntry
@@ -359,10 +397,32 @@ func (k *keyedLock) lock(key int64) func() {
 	k.mu.Unlock()
 
 	e.mu.Lock()
+	return k.unlockFunc(key, e)
+}
+
+// tryLock takes the lock of the key only if nobody holds or waits for it
+func (k *keyedLock) tryLock(key int64) (unlock func(), ok bool) {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = map[int64]*lockEntry{}
+	}
+	if _, busy := k.m[key]; busy {
+		k.mu.Unlock()
+		return nil, false
+	}
+	e := &lockEntry{refs: 1}
+	k.m[key] = e
+	e.mu.Lock()
+	k.mu.Unlock()
+	return k.unlockFunc(key, e), true
+}
+
+func (k *keyedLock) unlockFunc(key int64, e *lockEntry) func() {
 	return func() {
 		e.mu.Unlock()
 		k.mu.Lock()
-		if e.refs--; e.refs == 0 {
+		e.refs--
+		if e.refs == 0 {
 			delete(k.m, key)
 		}
 		k.mu.Unlock()

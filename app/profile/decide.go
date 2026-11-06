@@ -114,7 +114,7 @@ func relevance(a Answer, levels int) (float64, error) {
 
 // Decide applies the rules of the specification (section 5.3) to the scores. The returned reason names the
 // rule that fired, or why the event passed, so calibration can see near misses.
-func Decide(kind Kind, s Scores, th Thresholds) (Action, string) {
+func Decide(kind Kind, s Scores, th Thresholds) (action Action, reason string) {
 	bad := s.ProfileBad()
 
 	if s.ClassAsked && s.ClassProb >= th.CommentBan {
@@ -136,12 +136,10 @@ func Decide(kind Kind, s Scores, th Thresholds) (Action, string) {
 	switch {
 	case s.ClassAsked && s.ClassProb >= th.CommentReview:
 		return ActionReview, fmt.Sprintf("comment_class=%s %.2f in [%.2f, %.2f)", s.Class, s.ClassProb, th.CommentReview, th.CommentBan)
-	case bad >= th.ProfileReview && bad < th.ProfileBan:
-		return ActionReview, fmt.Sprintf("profile ads %.2f in [%.2f, %.2f)", bad, th.ProfileReview, th.ProfileBan)
+	case bad >= th.ProfileReview: // an ad profile nothing backs up goes to a human, however high the score
+		return ActionReview, fmt.Sprintf("profile ads %.2f >= %.2f", bad, th.ProfileReview)
 	case s.Photo >= th.Photo && s.Generic():
 		return ActionReview, fmt.Sprintf("provocative photo %.2f with generic comment %.2f", s.Photo, s.Relevance)
-	case bad >= th.ProfileBan:
-		return ActionPass, fmt.Sprintf("profile ads %.2f but nothing backs them up, comment is specific", bad)
 	}
 	return ActionPass, "no rule fired"
 }

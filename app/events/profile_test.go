@@ -3,7 +3,6 @@ package events
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -18,21 +17,32 @@ import (
 )
 
 type fakeProfile struct {
-	cleared  bool
-	hasOpen  bool
-	resolved []int64
-	first    bool
-	userID   int64
+	cleared    bool
+	hasOpen    bool
+	resolved   []int64
+	unresolved []int64
+	abandoned  []int64
+	first      bool
+	userID     int64
+	posts      map[int]string
 }
 
 func (f *fakeProfile) Check(context.Context, profile.Event) profile.Result { return profile.Result{} }
 func (f *fakeProfile) RememberPost(int, string)                            {}
-func (f *fakeProfile) PostText(int) string                                 { return "" }
+func (f *fakeProfile) PostText(id int) string                              { return f.posts[id] }
 func (f *fakeProfile) Cleared(context.Context, int64, time.Time) bool      { return f.cleared }
 func (f *fakeProfile) HasOpenReview(context.Context, int64, int64) bool    { return f.hasOpen }
 func (f *fakeProfile) Resolve(_ context.Context, id, _ int64, _ profile.Verdict) (profile.Record, bool, error) {
 	f.resolved = append(f.resolved, id)
-	return profile.Record{ID: id, UserID: f.userID}, f.first, nil
+	return profile.Record{ID: id, UserID: f.userID, UserName: "eva"}, f.first, nil
+}
+func (f *fakeProfile) Unresolve(_ context.Context, id int64) error {
+	f.unresolved = append(f.unresolved, id)
+	return nil
+}
+func (f *fakeProfile) Abandon(_ context.Context, _, id int64, _ string) error {
+	f.abandoned = append(f.abandoned, id)
+	return nil
 }
 
 type profileEnv struct {
@@ -100,7 +110,7 @@ func (e *profileEnv) cardButtons(t *testing.T) []string {
 	assert.Equal(t, int64(-2002), msg.ChatID)
 	kb, ok := msg.ReplyMarkup.(tbapi.InlineKeyboardMarkup)
 	require.True(t, ok)
-	var res []string
+	res := make([]string, 0, len(kb.InlineKeyboard[0]))
 	for _, b := range kb.InlineKeyboard[0] {
 		res = append(res, *b.CallbackData)
 	}
@@ -185,6 +195,18 @@ func TestApplyProfile(t *testing.T) {
 		assert.Equal(t, []string{"ban"}, env.requestTypes())
 	})
 
+	t.Run("review whose card is not sent lifts the restriction and gives the decision up", func(t *testing.T) {
+		env := newProfileEnv(t)
+		env.api.SendFunc = func(tbapi.Chattable) (tbapi.Message, error) {
+			return tbapi.Message{}, errors.New("bot left the admin chat")
+		}
+		env.l.applyProfile(context.Background(), commentEvent(), review, time.Now())
+		assert.Equal(t, []string{"delete", "restrict", "restrict"}, env.requestTypes())
+		lift := env.api.RequestCalls()[2].C.(tbapi.RestrictChatMemberConfig)
+		assert.True(t, lift.Permissions.CanSendMessages, "the second restrict gives the rights back")
+		assert.Equal(t, []int64{6}, env.prof.abandoned)
+	})
+
 	t.Run("review without admin group does nothing", func(t *testing.T) {
 		env := newProfileEnv(t)
 		env.l.adminChatID = 0
@@ -238,10 +260,10 @@ func TestHandleProfileCallback(t *testing.T) {
 		assert.NotContains(t, env.requestTypes(), "restrict")
 		assert.Empty(t, env.bot.AddApprovedUserCalls())
 		edit := env.api.SendCalls()[0].C.(tbapi.EditMessageTextConfig)
-		assert.True(t, strings.Contains(edit.Text, "already answered"), edit.Text)
+		assert.Contains(t, edit.Text, "already answered")
 	})
 
-	t.Run("failed action keeps the buttons and the same button repeats it", func(t *testing.T) {
+	t.Run("failed action keeps the buttons and takes the verdict back", func(t *testing.T) {
 		env := newProfileEnv(t)
 		fail := true
 		env.api.RequestFunc = func(c tbapi.Chattable) (*tbapi.APIResponse, error) {
@@ -254,17 +276,33 @@ func TestHandleProfileCallback(t *testing.T) {
 		q.Message.ReplyMarkup = &tbapi.InlineKeyboardMarkup{InlineKeyboard: [][]tbapi.InlineKeyboardButton{{{Text: "Not spam"}}}}
 		require.NoError(t, env.l.HandleProfileCallback(context.Background(), q))
 		edit := env.api.SendCalls()[0].C.(tbapi.EditMessageTextConfig)
-		assert.Contains(t, edit.Text, "press again to retry")
+		assert.Contains(t, edit.Text, "press a button again to retry")
 		assert.NotEmpty(t, edit.ReplyMarkup.InlineKeyboard, "buttons stay")
+		assert.Equal(t, []int64{6}, env.prof.unresolved, "the next press acts again, also after a restart")
 
-		fail, env.prof.first = false, false // the verdict is recorded, the second click is not the first
+		fail = false // the store has no verdict any more, so the next press is the first
 		require.NoError(t, env.l.HandleProfileCallback(context.Background(), q))
 		assert.Len(t, env.bot.AddApprovedUserCalls(), 2, "the retry ran the release again")
+		assert.Equal(t, "eva", env.bot.AddApprovedUserCalls()[1].Name)
 		edit = env.api.SendCalls()[1].C.(tbapi.EditMessageTextConfig)
 		assert.Empty(t, edit.ReplyMarkup.InlineKeyboard, "buttons are gone after success")
+		assert.Len(t, env.prof.unresolved, 1)
+	})
 
-		require.NoError(t, env.l.HandleProfileCallback(context.Background(), q))
-		assert.Len(t, env.bot.AddApprovedUserCalls(), 2, "nothing is repeated after success")
+	t.Run("failed channel ban is reported but not retried", func(t *testing.T) {
+		env := newProfileEnv(t)
+		env.l.linkedChannelID = -1003
+		env.api.RequestFunc = func(c tbapi.Chattable) (*tbapi.APIResponse, error) {
+			if b, ok := c.(tbapi.BanChatMemberConfig); ok && b.ChatID == -1003 {
+				return nil, errors.New("not enough rights")
+			}
+			return &tbapi.APIResponse{Ok: true}, nil
+		}
+		require.NoError(t, env.l.HandleProfileCallback(context.Background(), callback("Pb6", -2002)))
+		edit := env.api.SendCalls()[0].C.(tbapi.EditMessageTextConfig)
+		assert.Contains(t, edit.Text, "banned (failed: ban in channel)")
+		assert.Empty(t, edit.ReplyMarkup.InlineKeyboard)
+		assert.Empty(t, env.prof.unresolved)
 	})
 
 	t.Run("dry run buttons change nothing in telegram", func(t *testing.T) {
@@ -319,4 +357,29 @@ func TestProfileEligible(t *testing.T) {
 	env.l.Profile = nil
 	env.bot.IsApprovedUserFunc = func(int64) bool { return false }
 	assert.False(t, env.l.profileEligible(m, msg, -1001), "feature off")
+}
+
+func TestPostContext(t *testing.T) {
+	env := newProfileEnv(t)
+	env.prof.posts = map[int]string{100: "remembered post"}
+	forward := &tbapi.Message{MessageID: 100, Text: "post text", IsAutomaticForward: true}
+	tests := []struct {
+		name      string
+		m         *tbapi.Message
+		post, rep string
+	}{
+		{"comment in a remembered thread", &tbapi.Message{MessageThreadID: 100, ReplyToMessage: forward}, "remembered post", ""},
+		{"post not remembered, taken from the forward", &tbapi.Message{MessageThreadID: 200,
+			ReplyToMessage: &tbapi.Message{MessageID: 200, Caption: "caption post", IsAutomaticForward: true}}, "caption post", ""},
+		{"reply to another comment", &tbapi.Message{MessageThreadID: 100,
+			ReplyToMessage: &tbapi.Message{MessageID: 150, Text: "other comment"}}, "remembered post", "other comment"},
+		{"no thread, no reply", &tbapi.Message{}, "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			post, reply := env.l.postContext(tt.m)
+			assert.Equal(t, tt.post, post)
+			assert.Equal(t, tt.rep, reply)
+		})
+	}
 }

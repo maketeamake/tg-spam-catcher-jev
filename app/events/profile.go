@@ -2,8 +2,10 @@ package events
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +26,9 @@ const (
 	profileUnbanBtn       = "Pu"
 )
 
+// banInGroup is the failure of the ban in the group, the one a card action must retry
+const banInGroup = "ban in group"
+
 // profile queue defaults
 const (
 	defaultProfileWorkers = 64
@@ -36,6 +41,8 @@ type ProfileChecker interface {
 	RememberPost(msgID int, text string)
 	PostText(msgID int) string
 	Resolve(ctx context.Context, decisionID, adminID int64, v profile.Verdict) (profile.Record, bool, error)
+	Unresolve(ctx context.Context, decisionID int64) error
+	Abandon(ctx context.Context, userID, decisionID int64, why string) error
 	Cleared(ctx context.Context, userID int64, since time.Time) bool
 	HasOpenReview(ctx context.Context, userID, beforeDecisionID int64) bool
 }
@@ -126,7 +133,8 @@ func (l *TelegramListener) profileReaction(r *tbapi.MessageReactionUpdated) {
 	if l.Profile == nil || r.User == nil || r.User.IsBot || l.Bot.IsApprovedUser(r.User.ID) {
 		return
 	}
-	l.queueProfileEvent(profile.Event{Kind: profile.KindReaction, User: profileUserOf(r.User), ChatID: r.Chat.ID, MessageID: r.MessageID})
+	l.queueProfileEvent(profile.Event{Kind: profile.KindReaction, User: profileUserOf(r.User), ChatID: r.Chat.ID,
+		MessageID: r.MessageID})
 }
 
 // profileJoin queues the CAS (and optionally profile) check of a new member
@@ -149,7 +157,9 @@ func (l *TelegramListener) queueProfileEvent(ev profile.Event) {
 func (l *TelegramListener) applyProfile(ctx context.Context, ev profile.Event, res profile.Result, started time.Time) {
 	log.Printf("[DEBUG] profile %s check of %d: %s (%s), %v", ev.Kind, ev.User.ID, res.Action, res.Reason, res.Latency)
 	if res.Action == profile.ActionSkip {
-		log.Printf("[WARN] profile check of %d was not completed: %v", ev.User.ID, res.Err)
+		if res.Err != nil {
+			log.Printf("[WARN] profile check of %d was not completed: %v", ev.User.ID, res.Err)
+		}
 		return
 	}
 	if res.Action != profile.ActionBan && res.Action != profile.ActionReview {
@@ -168,34 +178,18 @@ func (l *TelegramListener) applyProfile(ctx context.Context, ev profile.Event, r
 
 func (l *TelegramListener) profileBan(ctx context.Context, ev profile.Event, res profile.Result) {
 	user := botUserOf(ev.User)
-	userStr := user.String()
-	if err := l.Bot.RemoveApprovedUser(ev.User.ID); err != nil {
-		log.Printf("[DEBUG] profile: user %d was not in the approved list: %v", ev.User.ID, err)
-	}
-
 	var failures []string
 	if l.deleteProfileMessage(ev) != nil {
 		failures = append(failures, "delete message")
 	}
-	if err := banUserOrChannel(banRequest{duration: bot.PermanentBanDuration, userID: ev.User.ID, userName: userStr,
-		chatID: l.chatID, dry: l.Dry, training: l.TrainingMode, tbAPI: l.TbAPI, restrict: l.SoftBanMode}); err != nil {
-		log.Printf("[WARN] profile: failed to ban %s: %v", userStr, err)
-		failures = append(failures, "ban in group")
-	}
-	if l.linkedChannelID != 0 && !l.SoftBanMode {
-		if err := banUserOrChannel(banRequest{duration: bot.PermanentBanDuration, userID: ev.User.ID, userName: userStr,
-			chatID: l.linkedChannelID, dry: l.Dry, training: l.TrainingMode, tbAPI: l.TbAPI}); err != nil {
-			log.Printf("[WARN] profile: failed to ban %s in the channel: %v", userStr, err)
-			failures = append(failures, "ban in channel")
-		}
-	}
+	failures = append(failures, l.banEverywhere(ev.User.ID, user.String())...)
 
-	// a burst of comments is checked in parallel and each result bans and deletes, but one card is enough
-	at, dup := l.profileBanned.LoadOrStore(ev.User.ID, time.Now())
-	if dup && time.Since(at.(time.Time)) < time.Minute {
+	// every comment of a burst is deleted and banned for, but one card a minute is enough
+	marker := time.Now()
+	if _, dup := l.profileBanned.LoadOrStore(ev.User.ID, marker); dup {
 		return
 	}
-	l.profileBanned.Store(ev.User.ID, time.Now())
+	time.AfterFunc(time.Minute, func() { l.profileBanned.CompareAndDelete(ev.User.ID, marker) })
 
 	checks := []spamcheck.Response{{Name: "profile", Spam: true, Details: res.Reason}}
 	if err := l.Locator.AddSpam(ctx, ev.User.ID, checks); err != nil {
@@ -208,15 +202,43 @@ func (l *TelegramListener) profileBan(ctx context.Context, ev profile.Event, res
 	l.SpamLogger.Save(&bot.Message{ID: ev.MessageID, From: user, Text: text},
 		&bot.Response{Send: true, BanInterval: bot.PermanentBanDuration, User: user, CheckResults: checks})
 
-	if l.AggressiveCleanup && !l.Dry && !l.TrainingMode && l.adminHandler != nil {
-		go func() {
-			if n, err := l.adminHandler.deleteUserMessages(ev.User.ID); err != nil {
-				log.Printf("[WARN] profile: aggressive cleanup of %d failed after %d messages: %v", ev.User.ID, n, err)
-			}
-		}()
+	l.cleanupUser(ev.User.ID)
+	if err := l.sendProfileCard(ev, res, l.cardTitle("banned"), failures, [][2]string{{"Unban", profileUnbanBtn}}); err != nil {
+		log.Printf("[WARN] profile: ban of %d has no card: %v", ev.User.ID, err)
 	}
+}
 
-	l.sendProfileCard(ev, res, l.cardTitle("banned"), failures, [][2]string{{"Unban", profileUnbanBtn}})
+// banEverywhere removes the approval and bans the user in the group and in the linked channel. It returns
+// the parts that failed.
+func (l *TelegramListener) banEverywhere(userID int64, userStr string) (failures []string) {
+	if err := l.Bot.RemoveApprovedUser(userID); err != nil {
+		log.Printf("[DEBUG] profile: user %d was not in the approved list: %v", userID, err)
+	}
+	if err := banUserOrChannel(banRequest{duration: bot.PermanentBanDuration, userID: userID, userName: userStr,
+		chatID: l.chatID, dry: l.Dry, training: l.TrainingMode, tbAPI: l.TbAPI, restrict: l.SoftBanMode}); err != nil {
+		log.Printf("[WARN] profile: failed to ban %s: %v", userStr, err)
+		failures = append(failures, banInGroup)
+	}
+	if l.linkedChannelID != 0 && !l.SoftBanMode {
+		if err := banUserOrChannel(banRequest{duration: bot.PermanentBanDuration, userID: userID, userName: userStr,
+			chatID: l.linkedChannelID, dry: l.Dry, training: l.TrainingMode, tbAPI: l.TbAPI}); err != nil {
+			log.Printf("[WARN] profile: failed to ban %s in the channel: %v", userStr, err)
+			failures = append(failures, "ban in channel")
+		}
+	}
+	return failures
+}
+
+// cleanupUser deletes the other messages of a banned user when aggressive cleanup is on
+func (l *TelegramListener) cleanupUser(userID int64) {
+	if !l.AggressiveCleanup || l.Dry || l.TrainingMode || l.adminHandler == nil {
+		return
+	}
+	go func() {
+		if n, err := l.adminHandler.deleteUserMessages(userID); err != nil {
+			log.Printf("[WARN] profile: aggressive cleanup of %d failed after %d messages: %v", userID, n, err)
+		}
+	}()
 }
 
 func (l *TelegramListener) profileReview(ctx context.Context, ev profile.Event, res profile.Result) {
@@ -247,7 +269,20 @@ func (l *TelegramListener) profileReview(ctx context.Context, ev profile.Event, 
 		log.Printf("[DEBUG] profile: user %d already has a review card, no new one", ev.User.ID)
 		return
 	}
-	l.sendProfileCard(ev, res, l.cardTitle("needs review"), failures, [][2]string{{"Ban", profileBanBtn}, {"Not spam", profileHamBtn}})
+	buttons := [][2]string{{"Ban", profileBanBtn}, {"Not spam", profileHamBtn}}
+	if err := l.sendProfileCard(ev, res, l.cardTitle("needs review"), failures, buttons); err != nil {
+		// without a card nobody can release the user: lift the restriction, and keep the decision from hiding
+		// the cards of later reviews
+		log.Printf("[WARN] profile: review card of %d not sent, restriction lifted: %v", ev.User.ID, err)
+		if !l.Dry && !l.TrainingMode {
+			if lerr := l.liftRestrictions(ev.User.ID); lerr != nil {
+				log.Printf("[WARN] profile: %v", lerr)
+			}
+		}
+		if aerr := l.Profile.Abandon(ctx, ev.User.ID, res.DecisionID, "card not sent"); aerr != nil {
+			log.Printf("[WARN] profile: can't mark decision %d: %v", res.DecisionID, aerr)
+		}
+	}
 }
 
 // deleteProfileMessage removes the flagged comment. Reactions and joins have nothing to delete.
@@ -255,12 +290,12 @@ func (l *TelegramListener) deleteProfileMessage(ev profile.Event) error {
 	if ev.Kind != profile.KindComment || ev.MessageID == 0 || l.Dry || l.TrainingMode {
 		return nil
 	}
-	_, err := l.TbAPI.Request(tbapi.DeleteMessageConfig{BaseChatMessage: tbapi.BaseChatMessage{
-		MessageID: ev.MessageID, ChatConfig: tbapi.ChatConfig{ChatID: ev.ChatID}}})
-	if err != nil {
+	if _, err := l.TbAPI.Request(tbapi.DeleteMessageConfig{BaseChatMessage: tbapi.BaseChatMessage{
+		MessageID: ev.MessageID, ChatConfig: tbapi.ChatConfig{ChatID: ev.ChatID}}}); err != nil {
 		log.Printf("[WARN] profile: failed to delete message %d: %v", ev.MessageID, err)
+		return fmt.Errorf("delete message %d: %w", ev.MessageID, err)
 	}
-	return err
+	return nil
 }
 
 func (l *TelegramListener) cardTitle(what string) string {
@@ -274,9 +309,10 @@ func (l *TelegramListener) cardTitle(what string) string {
 }
 
 // sendProfileCard posts the avatar and the card with buttons to the admin chat
-func (l *TelegramListener) sendProfileCard(ev profile.Event, res profile.Result, title string, failures []string, buttons [][2]string) {
+func (l *TelegramListener) sendProfileCard(ev profile.Event, res profile.Result, title string, failures []string,
+	buttons [][2]string) error {
 	if l.adminChatID == 0 {
-		return
+		return errors.New("no admin chat")
 	}
 	if d := res.Dossier; d != nil && len(d.Photos) > 0 {
 		photo := tbapi.NewPhoto(l.adminChatID, tbapi.FileID(d.Photos[0].FileID))
@@ -299,9 +335,10 @@ func (l *TelegramListener) sendProfileCard(ev profile.Event, res profile.Result,
 		msg.ParseMode = ""
 		msg.Text = html.UnescapeString(stripTags(msg.Text))
 		if _, err = l.TbAPI.Send(msg); err != nil {
-			log.Printf("[WARN] profile: failed to send card: %v", err)
+			return fmt.Errorf("failed to send card: %w", err)
 		}
 	}
+	return nil
 }
 
 func stripTags(s string) string {
@@ -386,34 +423,36 @@ func (l *TelegramListener) HandleProfileCallback(ctx context.Context, q *tbapi.C
 	if action == profileBanBtn {
 		verdict = profile.VerdictSpam
 	}
+	if action != profileBanBtn && action != profileHamBtn && action != profileUnbanBtn {
+		return fmt.Errorf("unknown profile action %q", action)
+	}
 	rec, first, err := l.Profile.Resolve(ctx, decisionID, q.From.ID, verdict)
 	if err != nil {
 		return fmt.Errorf("failed to resolve decision %d: %w", decisionID, err)
 	}
 	status := "already answered by someone else"
-	retried, _ := l.profileRetry.Load(decisionID)
 	keepButtons := false
-	if first || retried == action { // a failed action of the same button is repeated, the others are already answered
+	if first {
 		var actErr error
 		switch action {
 		case profileBanBtn:
-			actErr = l.banAfterReview(rec.UserID)
-			status = "banned"
+			var note string
+			note, actErr = l.banAfterReview(rec.UserID)
+			status = "banned" + note
 		case profileHamBtn:
-			actErr = l.releaseAfterReview(rec.UserID, false)
+			actErr = l.releaseAfterReview(rec.UserID, rec.UserName, false)
 			status = "marked not spam"
 		case profileUnbanBtn:
-			actErr = l.releaseAfterReview(rec.UserID, true)
+			actErr = l.releaseAfterReview(rec.UserID, rec.UserName, true)
 			status = "unbanned"
-		default:
-			return fmt.Errorf("unknown profile action %q", action)
 		}
 		if actErr != nil {
-			status += fmt.Sprintf(" (failed: %v, press again to retry)", actErr)
-			l.profileRetry.Store(decisionID, action)
+			// the verdict is taken back in the store, so any button acts again, also after a restart
+			status += fmt.Sprintf(" (failed: %v, press a button again to retry)", actErr)
 			keepButtons = true
-		} else {
-			l.profileRetry.Delete(decisionID)
+			if uerr := l.Profile.Unresolve(ctx, decisionID); uerr != nil {
+				log.Printf("[WARN] profile: can't take back the verdict of decision %d: %v", decisionID, uerr)
+			}
 		}
 	}
 
@@ -429,33 +468,23 @@ func (l *TelegramListener) HandleProfileCallback(ctx context.Context, q *tbapi.C
 	return nil
 }
 
-// banAfterReview bans a restricted user for real in the group and in the linked channel
-func (l *TelegramListener) banAfterReview(userID int64) error {
-	if err := l.Bot.RemoveApprovedUser(userID); err != nil {
-		log.Printf("[DEBUG] profile: user %d was not in the approved list: %v", userID, err)
+// banAfterReview bans a restricted user for real in the group and in the linked channel. Only a failed ban in the
+// group is an error worth a retry; a failed channel ban is reported in the note.
+func (l *TelegramListener) banAfterReview(userID int64) (note string, err error) {
+	failures := l.banEverywhere(userID, fmt.Sprintf("id:%d", userID))
+	if slices.Contains(failures, banInGroup) {
+		return "", errors.New(banInGroup + " failed")
 	}
-	userStr := fmt.Sprintf("id:%d", userID)
-	err := banUserOrChannel(banRequest{duration: bot.PermanentBanDuration, userID: userID, userName: userStr, chatID: l.chatID,
-		dry: l.Dry, training: l.TrainingMode, tbAPI: l.TbAPI, restrict: l.SoftBanMode})
-	if l.linkedChannelID != 0 && !l.SoftBanMode {
-		if cerr := banUserOrChannel(banRequest{duration: bot.PermanentBanDuration, userID: userID, userName: userStr,
-			chatID: l.linkedChannelID, dry: l.Dry, training: l.TrainingMode, tbAPI: l.TbAPI}); cerr != nil {
-			log.Printf("[WARN] profile: failed to ban %d in the channel: %v", userID, cerr)
-		}
+	l.cleanupUser(userID)
+	if len(failures) > 0 {
+		note = " (failed: " + strings.Join(failures, ", ") + ")"
 	}
-	if l.AggressiveCleanup && !l.Dry && !l.TrainingMode && l.adminHandler != nil {
-		go func() {
-			if _, derr := l.adminHandler.deleteUserMessages(userID); derr != nil {
-				log.Printf("[WARN] profile: aggressive cleanup of %d failed: %v", userID, derr)
-			}
-		}()
-	}
-	return err
+	return note, nil
 }
 
 // releaseAfterReview lifts the restriction (and the ban, if banned) and approves the user. Nothing is sent to
 // Telegram in dry-run and training mode.
-func (l *TelegramListener) releaseAfterReview(userID int64, unban bool) error {
+func (l *TelegramListener) releaseAfterReview(userID int64, userName string, unban bool) error {
 	var firstErr error
 	if !l.Dry && !l.TrainingMode {
 		if err := l.liftRestrictions(userID); err != nil {
@@ -477,7 +506,7 @@ func (l *TelegramListener) releaseAfterReview(userID int64, unban bool) error {
 			}
 		}
 	}
-	if err := l.Bot.AddApprovedUser(userID, ""); err != nil && firstErr == nil {
+	if err := l.Bot.AddApprovedUser(userID, userName); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("approve: %w", err)
 	}
 	return firstErr

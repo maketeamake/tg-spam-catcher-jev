@@ -34,13 +34,14 @@ type fakeTG struct {
 	photoID   string
 	fileURL   string
 	chatCalls int
+	chatErr   error
 }
 
 func (f *fakeTG) GetChat(tbapi.ChatInfoConfig) (tbapi.ChatFullInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.chatCalls++
-	return tbapi.ChatFullInfo{Bio: f.bio}, nil
+	return tbapi.ChatFullInfo{Bio: f.bio}, f.chatErr
 }
 
 func (f *fakeTG) GetUserProfilePhotos(tbapi.UserProfilePhotosConfig) (tbapi.UserProfilePhotos, error) {
@@ -98,7 +99,7 @@ func (f *fakeJev) handler(t *testing.T) http.Handler {
 		} else {
 			raw, _ = io.ReadAll(r.Body)
 		}
-		if st := int(f.status.Load()); st != 0 && !(st == http.StatusBadRequest && nimg == 0) {
+		if st := int(f.status.Load()); st != 0 && (st != http.StatusBadRequest || nimg != 0) {
 			w.WriteHeader(st)
 			_, _ = w.Write([]byte(`{"detail":"boom"}`))
 			return
@@ -107,7 +108,10 @@ func (f *fakeJev) handler(t *testing.T) http.Handler {
 			Model     string
 			Questions map[string]struct{ Type string }
 		}
-		require.NoError(t, json.Unmarshal(raw, &req))
+		if !assert.NoError(t, json.Unmarshal(raw, &req)) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		assert.Equal(t, DefaultJevModel, req.Model)
 		answers := map[string]any{}
 		for name, q := range req.Questions {
@@ -234,14 +238,19 @@ func TestService_ProfileVerdictAndDossierCache(t *testing.T) {
 	e.svc.Check(context.Background(), ev)
 	e.svc.Check(context.Background(), ev)
 	assert.EqualValues(t, 1, e.jev.calls.Load(), "profile answers are reused for reactions")
-	assert.Equal(t, 1, e.tg.chatCalls, "dossier is cached")
+	assert.Equal(t, 2, e.tg.chatCalls, "dossier is cached, only the freshness check reads the chat")
 
 	e.tg.mu.Lock()
 	e.tg.photoID = "b" // the user changed the avatar
 	e.tg.mu.Unlock()
 	e.svc.Check(context.Background(), ev)
 	assert.EqualValues(t, 2, e.jev.calls.Load(), "new avatar resets the caches")
-	assert.Equal(t, 2, e.tg.chatCalls)
+
+	e.tg.mu.Lock()
+	e.tg.bio = "escort, write me" // the user changed the bio
+	e.tg.mu.Unlock()
+	e.svc.Check(context.Background(), ev)
+	assert.EqualValues(t, 3, e.jev.calls.Load(), "new bio resets the caches")
 }
 
 func TestService_EmptyProfileAndJoinOff(t *testing.T) {
@@ -285,6 +294,11 @@ func TestService_ReviewFlowAndStats(t *testing.T) {
 	assert.False(t, e.svc.HasOpenReview(ctx, user.ID, res.DecisionID+1), "answered")
 	assert.True(t, e.svc.Cleared(ctx, user.ID, time.Now().Add(-time.Minute)))
 
+	require.NoError(t, e.svc.Unresolve(ctx, res.DecisionID), "a failed action takes the verdict back")
+	_, first, err = e.svc.Resolve(ctx, res.DecisionID, 2, VerdictSpam)
+	require.NoError(t, err)
+	assert.True(t, first, "the next press acts again")
+
 	st, err := e.svc.store.Stats(ctx, time.Now().Add(-time.Hour), time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Review)
@@ -294,6 +308,50 @@ func TestService_ReviewFlowAndStats(t *testing.T) {
 	require.NoError(t, e.svc.store.ExportCSV(ctx, &csv, time.Hour))
 	assert.Contains(t, csv.String(), "reviewed")
 	assert.Contains(t, csv.String(), "reaction")
+}
+
+func TestService_AbandonedReviewDoesNotHideCards(t *testing.T) {
+	e := newEnv(t)
+	e.tg.bio = "bio"
+	e.jev.noul = map[string]float64{"profile_scam": 0.7}
+	ctx := context.Background()
+	first := e.svc.Check(ctx, Event{Kind: KindReaction, User: user, ChatID: -100})
+	require.Equal(t, ActionReview, first.Action, first.Reason)
+	second := e.svc.Check(ctx, Event{Kind: KindReaction, User: user, ChatID: -100}) // got no card, hidden by the first
+	require.Equal(t, ActionReview, second.Action, second.Reason)
+
+	require.NoError(t, e.svc.Abandon(ctx, user.ID, first.DecisionID, "card not sent"))
+	assert.False(t, e.svc.HasOpenReview(ctx, user.ID, second.DecisionID+1), "both reviews are given up")
+	rec, err := e.svc.store.Decision(ctx, second.DecisionID)
+	require.NoError(t, err)
+	assert.Equal(t, string(ActionSkip), rec.Action)
+	assert.Contains(t, rec.Reason, "(card not sent)")
+}
+
+func TestService_UnreadProfileIsSkippedAndReadAgain(t *testing.T) {
+	e := newEnv(t)
+	e.tg.chatErr = errors.New("timeout")
+	ev := Event{Kind: KindReaction, User: user, ChatID: -100}
+	res := e.svc.Check(context.Background(), ev)
+	assert.Equal(t, ActionSkip, res.Action, "an unread profile is not an empty one")
+
+	e.tg.mu.Lock()
+	e.tg.chatErr, e.tg.bio = nil, "закладки 24/7"
+	e.tg.mu.Unlock()
+	e.jev.noul = map[string]float64{"profile_drugs": 0.99}
+	res = e.svc.Check(context.Background(), ev)
+	assert.Equal(t, ActionBan, res.Action, "the partial dossier was not cached: %s", res.Reason)
+}
+
+func TestService_ReactionSkippedWhileUserIsChecked(t *testing.T) {
+	e := newEnv(t)
+	e.tg.bio = "bio"
+	unlock := e.svc.locks.lock(user.ID)
+	res := e.svc.Check(context.Background(), Event{Kind: KindReaction, User: user, ChatID: -100})
+	unlock()
+	assert.Equal(t, ActionSkip, res.Action)
+	assert.Zero(t, e.jev.calls.Load())
+	assert.Empty(t, e.svc.locks.m)
 }
 
 func TestService_NoPhotoFilesOnDisk(t *testing.T) {
@@ -322,14 +380,12 @@ func TestKeyedLockSerialisesPerKey(t *testing.T) {
 	var inside atomic.Int32
 	var wg sync.WaitGroup
 	for range 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer k.lock(1)()
 			assert.EqualValues(t, 1, inside.Add(1))
 			time.Sleep(5 * time.Millisecond)
 			inside.Add(-1)
-		}()
+		})
 	}
 	wg.Wait()
 	assert.Empty(t, k.m, "entries are dropped when nobody waits")

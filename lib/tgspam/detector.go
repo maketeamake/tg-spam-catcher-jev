@@ -1174,13 +1174,16 @@ func (d *Detector) casLookup(ctx context.Context, msgID string) (spamcheck.Respo
 	if msgID == "" {
 		return spamcheck.Response{Spam: false, Name: "cas", Details: "check disabled"}, nil
 	}
+	fail := func(details string, err error) (spamcheck.Response, error) {
+		return spamcheck.Response{Spam: false, Name: "cas", Details: details}, fmt.Errorf("cas lookup failed: %w", err)
+	}
 	if _, err := strconv.ParseInt(msgID, 10, 64); err != nil {
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("invalid user id %q", msgID)}, err
+		return fail(fmt.Sprintf("invalid user id %q", msgID), err)
 	}
 	reqURL := fmt.Sprintf("%s/check?user_id=%s", d.CasAPI, msgID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, http.NoBody)
 	if err != nil {
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to make request %s: %v", reqURL, err)}, err
+		return fail(fmt.Sprintf("failed to make request %s: %v", reqURL, err), err)
 	}
 
 	// header, not the api_key query parameter: reqURL goes into Details and log lines
@@ -1235,7 +1238,7 @@ func (d *Detector) casLookup(ctx context.Context, msgID string) (spamcheck.Respo
 
 	if err != nil {
 		log.Printf("[WARN] CAS API request failed for user %s: %v", msgID, err)
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to send request %s: %v", reqURL, err)}, err
+		return fail(fmt.Sprintf("failed to send request %s: %v", reqURL, err), err)
 	}
 	defer resp.Body.Close()
 
@@ -1246,7 +1249,7 @@ func (d *Detector) casLookup(ctx context.Context, msgID string) (spamcheck.Respo
 
 	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
 		log.Printf("[WARN] CAS API response parse error for user %s: %v", msgID, err)
-		return spamcheck.Response{Spam: false, Name: "cas", Details: fmt.Sprintf("failed to parse response from %s: %v", reqURL, err)}, err
+		return fail(fmt.Sprintf("failed to parse response from %s: %v", reqURL, err), err)
 	}
 	respData.Description = strings.ToLower(respData.Description)
 	respData.Description = strings.TrimSuffix(respData.Description, ".")
